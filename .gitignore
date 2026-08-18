@@ -1,0 +1,13 @@
+data*/
+logs/
+outputs/
+scripts/benchmarking/
+scripts/demos/
+__pycache__/
+
+# Local experiment artifacts and backup copies.
+real_data/
+checkpoints/
+backups/
+tmp/
+*.orig
