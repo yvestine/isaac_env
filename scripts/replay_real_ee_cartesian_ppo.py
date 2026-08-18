@@ -38,9 +38,15 @@ if hasattr(args, "enable_cameras"):
     args.enable_cameras = True
 
 simulation_app = AppLauncher(args).app
+print("[TRACE] simulation_app ready", flush=True)
+
+from pxr import Gf, Usd, UsdGeom, UsdPhysics  # noqa: E402
+print("[TRACE] pxr ready", flush=True)
 
 import isaacsim.core.utils.torch as torch_utils  # noqa: E402
+print("[TRACE] isaac torch ready", flush=True)
 import tacex_tasks  # noqa: E402,F401
+print("[TRACE] tacex_tasks ready", flush=True)
 from isaaclab_tasks.utils import parse_env_cfg  # noqa: E402
 from tacex_tasks.real2sim.realsim_env import RealSimEnv, _write_h264_mp4  # noqa: E402
 
@@ -66,6 +72,9 @@ class PPOReplayEnv(RealSimEnv):
         self._grasp_constraint = False
         self._replay_target_q = None
         self._replay_target_gripper = 0.0
+        self._rigid_peg_root_path = (
+            "/World/envs/env_0/franka_env/Robot/franka/panda_hand/replay_rigid_peg"
+        )
         super().__init__(cfg, **kwargs)
         self._replay_kp = torch.tensor(
             [80.0, 80.0, 80.0, 80.0, 50.0, 30.0, 20.0],
@@ -89,10 +98,23 @@ class PPOReplayEnv(RealSimEnv):
         super()._setup_scene()
 
     def _prepare_robot_usd_for_replay(self) -> None:
-        # PPO coordinate replay has no extra rigid tool authoring. This hook
-        # exists only to keep scene bootstrap ordering identical to replay's
-        # proven articulation path.
-        return
+        """Author the peg as a child collision shape of panda_hand."""
+        stage = self.sim.stage
+        hand_path = "/World/envs/env_0/franka_env/Robot/franka/panda_hand"
+        hand_prim = stage.GetPrimAtPath(hand_path)
+        if not hand_prim.IsValid():
+            raise RuntimeError(f"PPO Franka hand prim is unavailable: {hand_path}")
+
+        peg_root = UsdGeom.Xform.Define(stage, self._rigid_peg_root_path)
+        peg_root.AddTranslateOp().Set(Gf.Vec3d(0.0, 0.0, 0.119463))
+        peg_root.AddOrientOp().Set(Gf.Quatf(0.0, Gf.Vec3f(0.0, 1.0, 0.0)))
+        peg = UsdGeom.Cylinder.Define(stage, f"{self._rigid_peg_root_path}/geometry")
+        peg.CreateRadiusAttr(0.003993)
+        peg.CreateHeightAttr(0.050)
+        peg.CreateDisplayColorAttr([Gf.Vec3f(1.0, 0.4157, 0.0)])
+        collision_api = UsdPhysics.CollisionAPI.Apply(peg.GetPrim())
+        collision_api.GetCollisionEnabledAttr().Set(True)
+        print(f"[Replay] rigid peg authored under panda_hand: {self._rigid_peg_root_path}", flush=True)
 
     def _apply_action(self) -> None:
         # Match the PPO geometry replay bootstrap: a complete articulation
@@ -149,6 +171,32 @@ def write_video(path: Path, frames: list[np.ndarray], fps: float) -> None:
     # OpenCV's mp4v output is MPEG-4 Part 2, not H.264.
     _write_h264_mp4(path, frames, fps)
 
+def wrench_row(env: RealSimEnv, attribute: str) -> np.ndarray:
+    """Read one already-computed PPO wrench stream without stepping physics."""
+    value = getattr(env, attribute, None)
+    if value is None:
+        raise RuntimeError(f"PPO wrench attribute is unavailable: {attribute}")
+    row = value[0].detach().cpu().numpy().astype(np.float64, copy=False).reshape(-1)
+    if row.shape != (6,) or not np.isfinite(row).all():
+        raise RuntimeError(f"PPO wrench {attribute} must be finite with shape (6,), got {row.shape}")
+    return row.copy()
+
+def write_matrix_csv(path: Path, header: list[str], rows: list[np.ndarray]) -> None:
+    """Write one final numeric stream; no intermediate replay files are created."""
+    values = np.asarray(rows, dtype=np.float64)
+    if values.ndim != 2 or values.shape[1] != len(header):
+        raise ValueError(f"CSV data/header shape mismatch for {path}: {values.shape} vs {len(header)}")
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(header)
+        writer.writerows(values.tolist())
+
+def write_scalar_csv(path: Path, header: str, values: list[float]) -> None:
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow([header])
+        writer.writerows([[float(value)] for value in values])
+
 def write_asset_pose(env: RealSimEnv, asset, pos: torch.Tensor, quat: torch.Tensor) -> None:
     state = asset.data.root_state_w.clone()
     state[:, :3] = pos + env.scene.env_origins
@@ -203,13 +251,16 @@ def set_direct_grasp(env: RealSimEnv) -> None:
     env.scene.update(dt=env.physics_dt)
     env._compute_intermediate_values(dt=env.physics_dt)
 
-def place_peg(env: RealSimEnv) -> None:
-    peg_quat, peg_pos = held_peg_pose(env)
-    write_asset_pose(env, env._held_asset, peg_pos, peg_quat)
-    env.scene.write_data_to_sim()
-    env.sim.forward()
-    env.scene.update(dt=env.physics_dt)
-    env._compute_intermediate_values(dt=env.physics_dt)
+def hide_dynamic_held_asset(env: RealSimEnv) -> None:
+    """Hide the old independent HeldAsset so only the rigid hand peg remains."""
+    root = env.sim.stage.GetPrimAtPath("/World/envs/env_0/HeldAsset")
+    if not root.IsValid():
+        raise RuntimeError("Independent HeldAsset prim is unavailable")
+    for prim in Usd.PrimRange(root):
+        if prim.IsA(UsdGeom.Imageable):
+            UsdGeom.Imageable(prim).MakeInvisible()
+        if prim.HasAPI(UsdPhysics.CollisionAPI):
+            UsdPhysics.CollisionAPI(prim).GetCollisionEnabledAttr().Set(False)
 
 def capture(env: RealSimEnv) -> tuple[np.ndarray, np.ndarray]:
     update_wrist = getattr(env, "_update_wrist_camera_pose", None)
@@ -224,7 +275,9 @@ def capture(env: RealSimEnv) -> tuple[np.ndarray, np.ndarray]:
     )
 
 def main() -> None:
+    print("[TRACE] main start", flush=True)
     q, ee_pose, timestamps = load_real_data(args.h5)
+    print(f"[TRACE] data loaded frames={len(q)}", flush=True)
     sim_xyz = transform_real_xyz(ee_pose)
     if args.endpoint_window < 1:
         raise ValueError("endpoint-window must be positive")
@@ -253,15 +306,19 @@ def main() -> None:
     cfg.sim.render_interval = 4
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    print("[TRACE] creating env", flush=True)
     env = PPOReplayEnv(cfg, render_mode="rgb_array", output_dir=str(args.output_dir))
+    print("[TRACE] env created", flush=True)
     try:
+        print("[TRACE] resetting env", flush=True)
         env.reset()
+        print("[TRACE] env reset", flush=True)
+        hide_dynamic_held_asset(env)
         hand_quat = ppo_hand_down_quat(env)
 
         # First establish the PPO-consistent real first-frame arm pose.
         init_error = move_ee_with_ppo_ik(env, sim_xyz[0], hand_quat)
         set_direct_grasp(env)
-        place_peg(env)
 
         # Visit the last real frames with the same PPO IK and infer one
         # fixed hole root from the resulting held-peg roots.
@@ -276,15 +333,32 @@ def main() -> None:
         write_asset_pose(env, env._fixed_asset, hole_pos_t, identity)
 
         # Return to the real first frame, clamp the peg, and record the
-        # complete coordinate replay. No per-link USD transform is used.
+        # complete coordinate replay. The peg is already a rigid child of the
+        # Franka hand; no per-frame asset pose write is performed.
         move_ee_with_ppo_ik(env, sim_xyz[0], hand_quat)
         set_direct_grasp(env)
-        place_peg(env)
         front_frames, wrist_frames = [], []
         sim_ee = []
+        wrench_streams = {
+            "wrench_model": [],
+            "wrench_model_clean": [],
+            "wrench_raw": [],
+            "wrench_anchor": [],
+            "wrench_base": [],
+            "wrench_corrected": [],
+            "wrench_final": [],
+            "force_sensor_parent_smooth": [],
+            "wrench_tool_smooth": [],
+        }
+        replay_timestamps = []
         for index, xyz in enumerate(sim_xyz):
             error = move_ee_with_ppo_ik(env, xyz, hand_quat)
-            place_peg(env)
+            # move_ee_with_ppo_ik already calls _compute_intermediate_values(),
+            # which updates every stream below. Reading them here does not add
+            # a physics step or overwrite the rigid peg pose.
+            for attribute in wrench_streams:
+                wrench_streams[attribute].append(wrench_row(env, attribute))
+            replay_timestamps.append(float(timestamps[index] - timestamps[0]))
             front, wrist = capture(env)
             front_frames.append(front)
             wrist_frames.append(wrist)
@@ -300,6 +374,21 @@ def main() -> None:
             writer = csv.writer(handle)
             writer.writerow(["x", "y", "z", "qw", "qx", "qy", "qz"])
             writer.writerows(np.asarray(sim_ee).tolist())
+        wrench_header = ["Fx", "Fy", "Fz", "Tx", "Ty", "Tz"]
+        for filename, attribute in (
+            ("wrench_model.csv", "wrench_model"),
+            ("force_local.csv", "wrench_model"),
+            ("wrench_model_clean.csv", "wrench_model_clean"),
+            ("wrench_raw.csv", "wrench_raw"),
+            ("wrench_anchor.csv", "wrench_anchor"),
+            ("wrench_base.csv", "wrench_base"),
+            ("wrench_corrected.csv", "wrench_corrected"),
+            ("wrench_final.csv", "wrench_final"),
+            ("wrench_parent_smooth.csv", "force_sensor_parent_smooth"),
+            ("wrench_tool_smooth.csv", "wrench_tool_smooth"),
+        ):
+            write_matrix_csv(args.output_dir / filename, wrench_header, wrench_streams[attribute])
+        write_scalar_csv(args.output_dir / "timestamps.csv", "timestamp", replay_timestamps)
         metadata = {
             "controller": "RealSimEnv PPO DLS IK",
             "robot_articulation_path": "/World/envs/env_.*/franka_env/Robot/franka",
@@ -308,10 +397,30 @@ def main() -> None:
             "first_frame_ik_error": init_error,
             "endpoint_window": window,
             "hole_position_sim_m": hole_pos.tolist(),
+            "peg_mode": "rigid_child_collision_under_panda_hand",
+            "peg_root_prim": env._rigid_peg_root_path,
+            "independent_held_asset_hidden": True,
             "peg_diameter_m": float(cfg.task.held_asset_cfg.diameter),
             "hole_diameter_m": float(cfg.task.fixed_asset_cfg.diameter),
             "frame_count": len(sim_xyz),
             "fps": float(args.fps),
+            "force_collection": {
+                "primary_file": "wrench_model.csv",
+                "primary_source": "env.wrench_model",
+                "policy_observation_path": "forge_env._get_observations -> noisy_force -> wrench_model",
+                "clean_file": "wrench_model_clean.csv",
+                "clean_source": "env.wrench_model_clean",
+                "smoothing_factor": float(getattr(cfg, "ft_smoothing_factor", float("nan"))),
+                "noise_std": [
+                    float(value)
+                    for value in getattr(env, "wrench_noise_std", torch.zeros(6, device=env.device))[0]
+                    .detach()
+                    .cpu()
+                ],
+                "component_order": wrench_header,
+                "units": ["N", "N", "N", "N*m", "N*m", "N*m"],
+                "collection_note": "All streams are read after the existing PPO intermediate-value update; no extra simulation step is performed.",
+            },
         }
         (args.output_dir / "replay_metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
         print(f"[DONE] front: {args.output_dir / 'front_camera.mp4'}", flush=True)
