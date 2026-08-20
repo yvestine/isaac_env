@@ -1,0 +1,16 @@
+{
+  "trajectories": {
+    "traj_0": {
+      "position_m": [0.0, 0.0, 0.0],
+      "quaternion_wxyz": [1.0, 0.0, 0.0, 0.0],
+      "frame": "sim_world",
+      "source": "independent_measurement"
+    },
+    "traj_1": {
+      "position_m": [0.0, 0.0, 0.0],
+      "quaternion_wxyz": [1.0, 0.0, 0.0, 0.0],
+      "frame": "sim_world",
+      "source": "independent_measurement"
+    }
+  }
+}

@@ -1,0 +1,1 @@
+./isaaclab.sh -p -m pip install -e source/tacex_tasks
