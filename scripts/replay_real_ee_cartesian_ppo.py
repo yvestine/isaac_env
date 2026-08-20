@@ -13,7 +13,10 @@ from __future__ import annotations
 
 import argparse
 import csv
+import atexit
 import json
+import os
+import tempfile
 from pathlib import Path
 
 import cv2
@@ -38,17 +41,43 @@ if hasattr(args, "enable_cameras"):
     args.enable_cameras = True
 
 simulation_app = AppLauncher(args).app
-print("[TRACE] simulation_app ready", flush=True)
-
-from pxr import Gf, Usd, UsdGeom, UsdPhysics  # noqa: E402
-print("[TRACE] pxr ready", flush=True)
+from pxr import Gf, Sdf, Usd, UsdGeom, UsdPhysics  # noqa: E402
 
 import isaacsim.core.utils.torch as torch_utils  # noqa: E402
-print("[TRACE] isaac torch ready", flush=True)
 import tacex_tasks  # noqa: E402,F401
-print("[TRACE] tacex_tasks ready", flush=True)
+
 from isaaclab_tasks.utils import parse_env_cfg  # noqa: E402
 from tacex_tasks.real2sim.realsim_env import RealSimEnv, _write_h264_mp4  # noqa: E402
+
+def create_rigid_peg_robot_usd() -> Path:
+    """Create a temporary Franka wrapper with peg collision under panda_hand."""
+    source = Path(__file__).resolve().parents[1] / "assets/Factory/franka_mimic.usd"
+    if not source.is_file():
+        raise FileNotFoundError(f"Franka source USD not found: {source}")
+    fd, filename = tempfile.mkstemp(prefix="tacex_rigid_franka_", suffix=".usd")
+    os.close(fd)
+    path = Path(filename)
+    stage = Usd.Stage.CreateNew(str(path))
+    root = UsdGeom.Xform.Define(stage, "/franka")
+    root.GetPrim().GetReferences().AddReference(str(source), "/panda")
+    stage.SetDefaultPrim(root.GetPrim())
+    peg_root = UsdGeom.Xform.Define(stage, "/franka/panda_hand/replay_rigid_peg")
+    peg_root.AddTranslateOp().Set(Gf.Vec3d(0.0, 0.0, 0.119463))
+    peg_root.AddOrientOp().Set(Gf.Quatf(0.0, Gf.Vec3f(0.0, 1.0, 0.0)))
+    peg = UsdGeom.Cylinder.Define(stage, "/franka/panda_hand/replay_rigid_peg/geometry")
+    peg.CreateRadiusAttr(0.003993)
+    peg.CreateHeightAttr(0.050)
+    peg.CreateDisplayColorAttr([Gf.Vec3f(1.0, 0.4157, 0.0)])
+    collision_api = UsdPhysics.CollisionAPI.Apply(peg.GetPrim())
+    collision_api.GetCollisionEnabledAttr().Set(True)
+    stage.GetRootLayer().Save()
+    print(f"[Replay] composed rigid peg USD: {path}", flush=True)
+    return path
+
+
+_RIGID_ROBOT_USD = create_rigid_peg_robot_usd()
+atexit.register(lambda: _RIGID_ROBOT_USD.unlink(missing_ok=True))
+
 
 class PPOReplayEnv(RealSimEnv):
     """PPO-compatible bootstrap with one complete Franka articulation."""
@@ -93,28 +122,15 @@ class PPOReplayEnv(RealSimEnv):
         ).view(1, 7)
 
     def _setup_scene(self):
-        # Keep the PPO scene construction path explicit. The background USD
-        # and the Articulation use the same /Robot/franka prim path.
+        # Keep the PPO scene construction path unchanged. The rigid peg is
+        # already composed into the robot USD before this scene is spawned.
         super()._setup_scene()
 
     def _prepare_robot_usd_for_replay(self) -> None:
-        """Author the peg as a child collision shape of panda_hand."""
-        stage = self.sim.stage
-        hand_path = "/World/envs/env_0/franka_env/Robot/franka/panda_hand"
-        hand_prim = stage.GetPrimAtPath(hand_path)
-        if not hand_prim.IsValid():
-            raise RuntimeError(f"PPO Franka hand prim is unavailable: {hand_path}")
-
-        peg_root = UsdGeom.Xform.Define(stage, self._rigid_peg_root_path)
-        peg_root.AddTranslateOp().Set(Gf.Vec3d(0.0, 0.0, 0.119463))
-        peg_root.AddOrientOp().Set(Gf.Quatf(0.0, Gf.Vec3f(0.0, 1.0, 0.0)))
-        peg = UsdGeom.Cylinder.Define(stage, f"{self._rigid_peg_root_path}/geometry")
-        peg.CreateRadiusAttr(0.003993)
-        peg.CreateHeightAttr(0.050)
-        peg.CreateDisplayColorAttr([Gf.Vec3f(1.0, 0.4157, 0.0)])
-        collision_api = UsdPhysics.CollisionAPI.Apply(peg.GetPrim())
-        collision_api.GetCollisionEnabledAttr().Set(True)
-        print(f"[Replay] rigid peg authored under panda_hand: {self._rigid_peg_root_path}", flush=True)
+        # RealSimEnv calls this hook before spawning the robot. The wrapper USD
+        # handles the rigid peg composition, so no runtime stage mutation is
+        # needed here.
+        return
 
     def _apply_action(self) -> None:
         # Match the PPO geometry replay bootstrap: a complete articulation
@@ -275,9 +291,7 @@ def capture(env: RealSimEnv) -> tuple[np.ndarray, np.ndarray]:
     )
 
 def main() -> None:
-    print("[TRACE] main start", flush=True)
     q, ee_pose, timestamps = load_real_data(args.h5)
-    print(f"[TRACE] data loaded frames={len(q)}", flush=True)
     sim_xyz = transform_real_xyz(ee_pose)
     if args.endpoint_window < 1:
         raise ValueError("endpoint-window must be positive")
@@ -287,6 +301,7 @@ def main() -> None:
     # authored for the Fabric path; the non-Fabric path can leave the physics
     # scene stepping subscription invalid during startup.
     cfg = parse_env_cfg(args.task, device=args.device, num_envs=1, use_fabric=True)
+    cfg.robot.spawn.usd_path = str(_RIGID_ROBOT_USD)
     cfg.scene.num_envs = 1
     cfg.policy_cfg = None
     cfg.teacher_policy_cfg = None
@@ -306,14 +321,9 @@ def main() -> None:
     cfg.sim.render_interval = 4
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    print("[TRACE] creating env", flush=True)
     env = PPOReplayEnv(cfg, render_mode="rgb_array", output_dir=str(args.output_dir))
-    print("[TRACE] env created", flush=True)
     try:
-        print("[TRACE] resetting env", flush=True)
         env.reset()
-        print("[TRACE] env reset", flush=True)
-        hide_dynamic_held_asset(env)
         hand_quat = ppo_hand_down_quat(env)
 
         # First establish the PPO-consistent real first-frame arm pose.
@@ -397,9 +407,10 @@ def main() -> None:
             "first_frame_ik_error": init_error,
             "endpoint_window": window,
             "hole_position_sim_m": hole_pos.tolist(),
-            "peg_mode": "rigid_child_collision_under_panda_hand",
+            "peg_mode": "rigid_child_collision_in_robot_usd",
             "peg_root_prim": env._rigid_peg_root_path,
             "independent_held_asset_hidden": True,
+            "per_frame_peg_pose_write": False,
             "peg_diameter_m": float(cfg.task.held_asset_cfg.diameter),
             "hole_diameter_m": float(cfg.task.fixed_asset_cfg.diameter),
             "frame_count": len(sim_xyz),

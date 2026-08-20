@@ -1,0 +1,1 @@
+isaacsim isaacsim.exp.full.streaming --no-window --/persistent/isaac/asset_root/default="/ext_workspace/tpy/isaac_sim_assets/Assets/Isaac/5.1"
