@@ -1,4 +1,8 @@
 data*/
+!source/tacex_assets/
+!source/tacex_assets/tacex_assets/
+!source/tacex_assets/tacex_assets/data/
+!source/tacex_assets/tacex_assets/data/**
 logs/
 outputs/
 scripts/benchmarking/
