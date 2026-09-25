@@ -2,12 +2,12 @@ from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.utils import configclass
 
 from .policy.configuration_pi0remote import PI0RemoteTAVLAConfig
-from .realsim_env_cfg import RealSimTaskPegInsertCfg
+from .pi0_env_cfg import RealSimPi0PegInsertCfg
 
 
 @configclass
-class RealSimTavlaResidualPegInsertCfg(RealSimTaskPegInsertCfg):
-    """Single-env residual PPO config around the frozen TAVLA teacher."""
+class RealSimTavlaResidualPegInsertCfg(RealSimPi0PegInsertCfg):
+    """Pi0 RealSim scene with the frozen TAVLA force-conditioned teacher."""
 
     action_space: int = 8
     scene = InteractiveSceneCfg(
@@ -20,8 +20,8 @@ class RealSimTavlaResidualPegInsertCfg(RealSimTaskPegInsertCfg):
     policy_cfg = None
     teacher_policy_cfg = PI0RemoteTAVLAConfig(
         n_action_steps=50,
-        num_history_steps=1,
-        history_step_interval=1,
+        num_history_steps=10,
+        history_step_interval=4,
     )
     teacher_prompt = "peg-in-hole"
     # Affine sim-to-real wrench adapter used only by the affine deployment
@@ -34,23 +34,24 @@ class RealSimTavlaResidualPegInsertCfg(RealSimTaskPegInsertCfg):
     teacher_policy_reference_state: list = [-0.05648576654493809, 0.06290022935718298, 0.2503179907798767, -1.990307331085205, -0.035843100398778915, 2.102778196334839, 1.0133224725723267]
     # Skip the action corresponding to the current observation on every
     # network round-trip, including replans after the first chunk.
-    teacher_action_start_index: int = 1
-    teacher_hold_steps: int = 3
-    # First closed-loop pass: use actions[1] and replan after one predicted action.
-    teacher_replan_actions: int = 5
+    # TAVLA is a force-conditioned Pi0 checkpoint. Keep the same forward-label
+    # compensation and receding-horizon timing as the validated Pi0 rollout.
+    teacher_action_start_index: int = 5
+    teacher_hold_steps: int = 1
+    teacher_replan_actions: int = 10
     teacher_action_interpolation: bool = True
     teacher_speed_scale: float = 1.0
-    # Robust P95 limits fitted from the 40 real H5 trajectories. Units are
-    # rad/s and rad/s^2, and are applied in the 30 Hz simulation command path.
-    teacher_joint_velocity_limits: list = [0.07953, 0.13770, 0.00148, 0.15825, 0.05380, 0.12145, 0.09179]
-    teacher_joint_acceleration_limits: list = [0.29079, 1.53436, 0.01800, 0.63842, 0.72472, 1.45085, 0.73457]
+    # Use the same conservative joint slew limits as the validated Pi0
+    # 10 Hz command path. Units are rad/s and rad/s^2.
+    teacher_joint_velocity_limits: list = [0.015] * 7
+    teacher_joint_acceleration_limits: list = [0.7] * 7
     teacher_gripper_velocity_limit: float = 2.0
     teacher_eval_only: bool = False
     teacher_control_mode: str = "aligned_joint"
     teacher_visual_profile: str = "raw"
     teacher_camera_calibration: str = ""
-    # p99 from all 40 real_data/traj_*/data.h5 files. Translation is
-    # [m/s] and rotation is [rad/s]; one scale preserves the full 6D direction.
+    # Kept for the optional task-space diagnostic path. Translation is [m/s]
+    # and rotation is [rad/s].
     teacher_taskspace_velocity_limits: list = [0.13797, 0.15633, 0.14112, 0.00260, 0.00845, 0.00215]
     # p99 of the complete base-frame [F, T] wrench norm from the same 40 files.
     teacher_force_norm_p99: float = 13.49642
@@ -59,6 +60,16 @@ class RealSimTavlaResidualPegInsertCfg(RealSimTaskPegInsertCfg):
     # normalization through the checkpoint's norm_stats.
     teacher_wrench_scale: list = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
     teacher_wrench_bias: list = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    # Optional inference-time contact gate.  It uses direct PhysX contact
+    # reporting for HeldAsset <-> FixedAsset, rather than the noisy
+    # joint-derived wrench, to decide when the real simulated wrench may be
+    # exposed to the frozen TAVLA model.  Disabled by default to preserve the
+    # legacy rollout behavior.
+    tavla_force_gate_enabled: bool = False
+    tavla_force_gate_threshold_n: float = 0.5
+    tavla_force_gate_confirm_steps: int = 2
+    tavla_force_gate_release_steps: int = 3
+    tavla_force_gate_precontact_wrench: list = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
     # Optional sim-only oracle alignment. It uses privileged held-peg and hole poses plus the Franka Jacobian to correct XY drift while leaving TAVLA responsible for insertion and gripper behavior.
     # Keep the default evaluation pure TAVLA. Enable this explicitly for a
     # privileged XY-ablation/diagnostic run; it is not part of the teacher.
@@ -84,8 +95,8 @@ class RealSimTavlaResidualPegInsertCfg(RealSimTaskPegInsertCfg):
     # Dynamics-aligned joint-space PD from the saved hierarchical replay
     # validation. The first four joints use the arm1 fit and the last three
     # use the arm2 fit; force/torque alignment remains intentionally separate.
-    joint_target_kp: list = [303.3830260094937] * 4 + [148.56203519189626] * 3
-    joint_target_kd: list = [36.850833024805276] * 4 + [17.460777084541743] * 3
+    joint_target_kp: list = [200.0] * 7
+    joint_target_kd: list = [40.0] * 7
     use_implicit_position_servo: bool = True
     joint_target_effort_limits: list = [87.0, 87.0, 87.0, 87.0, 12.0, 12.0, 12.0]
 

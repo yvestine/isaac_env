@@ -5,7 +5,7 @@
 
 import torch
 
-import isaacsim.core.utils.torch as torch_utils
+import tacex_tasks.torch_compat as torch_utils
 
 
 def get_random_prop_gains(default_values, noise_levels, num_envs, device):

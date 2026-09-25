@@ -10,7 +10,20 @@ from .realsim_env import RealSimEnv
 from .realsim_env_cfg import RealSimTaskPegInsertCfg, RealSimTaskGearMeshCfg, RealSimTaskNutThreadCfg
 from .tavla_residual_env import TavlaResidualEnv
 from .tavla_residual_env_cfg import RealSimTavlaResidualPegInsertCfg, RealSimTavlaTeacherPegInsertCfg
-from .tavla_baseline.isaac_env import TavlaAffineResidualEnv
+from .pi0_env import Pi0RealSimEnv
+from .pi0_env_cfg import RealSimPi0PegInsertCfg
+from .pi0_direct_joint_reset_env import (
+    Pi0DirectJointResetEnv,
+    RealSimPi0DirectJointResetPegInsertCfg,
+)
+
+
+def __getattr__(name):
+    """Load the optional TAVLA baseline only when it is requested."""
+    if name == "TavlaAffineResidualEnv":
+        from .tavla_baseline.isaac_env import TavlaAffineResidualEnv
+        return TavlaAffineResidualEnv
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 ##
 # Register Gym environments.
@@ -75,5 +88,25 @@ gym.register(
     kwargs={
         "env_cfg_entry_point": RealSimTavlaResidualPegInsertCfg,
         "rl_games_cfg_entry_point": f"{agents.__name__}:rl_games_ppo_tavla_residual_cfg.yaml",
+    },
+)
+
+gym.register(
+    id="TacEx-RealSim-PegInsert-PI0-Direct-v0",
+    entry_point=f"{__name__}.pi0_env:Pi0RealSimEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": RealSimPi0PegInsertCfg,
+        "rl_games_cfg_entry_point": f"{agents.__name__}:rl_games_ppo_cfg.yaml",
+    },
+)
+
+gym.register(
+    id="TacEx-RealSim-PegInsert-PI0-DirectJointReset-v0",
+    entry_point=f"{__name__}.pi0_direct_joint_reset_env:Pi0DirectJointResetEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": RealSimPi0DirectJointResetPegInsertCfg,
+        "rl_games_cfg_entry_point": f"{agents.__name__}:rl_games_ppo_cfg.yaml",
     },
 )

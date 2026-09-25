@@ -4,6 +4,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 import copy
+from pathlib import Path
 import numpy as np
 import torch
 import os
@@ -17,13 +18,19 @@ import time
 from .forge_env import ForgeEnv
 from .realsim_env_cfg import RealSimEnvCfg
 from isaaclab.sensors import TiledCamera
-import isaacsim.core.utils.torch as torch_utils
+from isaaclab.utils import math as isaaclab_math
+import tacex_tasks.torch_compat as torch_utils
 from isaaclab_tasks.direct.factory import factory_control, factory_utils
 import isaaclab.sim as sim_utils
 import carb
 
 from isaaclab.assets import Articulation
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
+
+
+def _sim_flag(sim, name):
+    value = getattr(sim, name, False)
+    return bool(value() if callable(value) else value)
 
 
 def _write_h264_mp4(video_path, frames, fps):
@@ -208,12 +215,24 @@ class RealSimEnv(ForgeEnv):
         self.save_failed_trajectory = cfg.data_collect_cfg["save_failed_trajectory"]
         self.num_trajectories = cfg.data_collect_cfg["num_trajectories"]
         self.minimal_output = bool(cfg.data_collect_cfg.get("minimal_output", False))
+        self.save_policy_input_video = bool(
+            cfg.data_collect_cfg.get("save_policy_input_video", False)
+        )
+        self.save_raw_camera_video = bool(
+            cfg.data_collect_cfg.get("save_raw_camera_video", True)
+        )
+        self.save_reward_video = bool(
+            cfg.data_collect_cfg.get("save_reward_video", True)
+        )
         self.save_tavla_hdf5 = bool(cfg.data_collect_cfg.get("save_tavla_hdf5", True))
         self.tavla_hdf5_dir = str(cfg.data_collect_cfg.get("tavla_hdf5_dir", "tavla_raw"))
         self.cur_num_traj = 0
 
         self.output_dir = output_dir
         self._record_data_mask = None
+        self._model_visual_frame_ready = False
+        self.last_model_input_front = None
+        self.last_model_input_wrist = None
 
         
         if self.collect_data:
@@ -250,6 +269,8 @@ class RealSimEnv(ForgeEnv):
                     "tavla_server_effort": [],
                     "tavla_server_effort_matches_final": [],
                     "tavla_policy_wrench": [],
+                    "tavla_force_gate_active": [],
+                    "tavla_force_gate_contact_norm": [],
                     "tavla_actual_state": [],
                     "tavla_policy_state": [],
                     "tavla_combined_targets": [],
@@ -278,6 +299,335 @@ class RealSimEnv(ForgeEnv):
         self.success_times = 0
         self.total_times = 0
 
+    @staticmethod
+    def _make_background_robot_visual_only(stage, prim_path: str) -> None:
+        """Keep a background robot visible without adding physics or control."""
+
+        from pxr import Usd, UsdPhysics
+
+        root = stage.GetPrimAtPath(prim_path)
+        if not root.IsValid():
+            print(f"[RealSim] Background visual robot not found: {prim_path}")
+            return
+
+        rigid_body_count = 0
+        collision_count = 0
+        joint_paths = []
+        for prim in Usd.PrimRange(root):
+            if prim.IsA(UsdPhysics.Joint):
+                joint_paths.append(str(prim.GetPath()))
+            if prim.HasAPI(UsdPhysics.RigidBodyAPI):
+                UsdPhysics.RigidBodyAPI(prim).GetRigidBodyEnabledAttr().Set(False)
+                rigid_body_count += 1
+            if prim.HasAPI(UsdPhysics.CollisionAPI):
+                UsdPhysics.CollisionAPI(prim).GetCollisionEnabledAttr().Set(False)
+                collision_count += 1
+
+        for joint_path in joint_paths:
+            stage.OverridePrim(joint_path).SetActive(False)
+
+        print(
+            "[RealSim] Kept background robot as visual-only: "
+            f"{prim_path} rigid_bodies={rigid_body_count} "
+            f"colliders_disabled={collision_count} joints_removed={len(joint_paths)}"
+        )
+
+
+
+    @staticmethod
+    def _spawn_pi0_black_gripper_visual(stage, source_usd: str, hand_path: str) -> None:
+        """Mount rollout black finger subtrees on the active Pi0 fingers."""
+
+        from pxr import Gf, Sdf, Usd, UsdGeom, UsdShade
+
+        # Rollout mounts each black long-finger subtree below its corresponding
+        # articulated finger, not below panda_hand. Referencing the authored
+        # fingertip subtree preserves its exact local transform and material.
+        robot_path = hand_path.rsplit("/", 1)[0]
+        finger_specs = {
+            "left": (
+                f"{robot_path}/panda_leftfinger/panda_leftfingertip",
+                "/World/Robot/franka/panda_leftfinger/panda_leftfingertip",
+            ),
+            "right": (
+                f"{robot_path}/panda_rightfinger/panda_rightfingertip",
+                "/World/Robot/franka/panda_rightfinger/panda_rightfingertip",
+            ),
+        }
+        black_material_path = "/World/Looks/pi0_rollout_plastic_black"
+        black_material = UsdShade.Material.Define(stage, black_material_path)
+        black_material.GetPrim().GetReferences().AddReference(
+            source_usd,
+            "/World/Robot/franka/panda_link7/visuals/hand/geometry_01/Looks/PlasticBlack",
+        )
+
+        # The generic Franka asset has the same material subset layout as
+        # rollout, but its imported PlasticBlack shader is gray. Override
+        # that active shader to the rollout value without editing the asset.
+        active_black_shader_path = f"{robot_path}/Looks/material_Part__Feature_007/Shader"
+        active_black_shader_prim = stage.GetPrimAtPath(active_black_shader_path)
+        if active_black_shader_prim.IsValid():
+            active_black_shader = UsdShade.Shader(active_black_shader_prim)
+            active_black_input = active_black_shader.GetInput("diffuse_color_constant")
+            if active_black_input.IsValid():
+                active_black_input.Set(Gf.Vec3f(0.0, 0.0, 0.0))
+
+        for name, (target_path, source_path) in finger_specs.items():
+            if not stage.GetPrimAtPath(target_path).IsValid():
+                fingertip = UsdGeom.Xform.Define(stage, target_path)
+                fingertip.GetPrim().GetReferences().AddReference(source_usd, source_path)
+            for prim in Usd.PrimRange(stage.GetPrimAtPath(target_path)):
+                if prim.IsA(UsdGeom.Mesh):
+                    UsdShade.MaterialBindingAPI.Apply(prim).Bind(black_material)
+            subset_path = f"{robot_path}/panda_{name}finger/visuals/material_1"
+            subset = stage.GetPrimAtPath(subset_path)
+            if subset.IsValid():
+                UsdShade.MaterialBindingAPI.Apply(subset).Bind(black_material)
+        print(f"[RealSim] Restored rollout black gripper under: {robot_path}")
+
+    @staticmethod
+    def _spawn_background_robot_visual(
+        stage,
+        source_usd: str,
+        source_prim_path: str,
+        prim_path: str,
+        offset_pos,
+    ) -> None:
+        """Reference a robot visual under a translated, non-controlled wrapper."""
+
+        from pxr import Gf, UsdGeom
+
+        if stage.GetPrimAtPath(prim_path).IsValid():
+            return
+
+        parent_path = prim_path.rsplit("/", 1)[0]
+        parent = UsdGeom.Xform.Define(stage, parent_path)
+        parent.AddTranslateOp().Set(Gf.Vec3d(*offset_pos))
+        source_root = stage.DefinePrim(prim_path, "Xform")
+        source_root.GetReferences().AddReference(source_usd, source_prim_path)
+
+    @staticmethod
+    def _hide_active_robot_render_meshes(stage, robot_path: str) -> None:
+        """Hide render meshes without touching articulation or collision data."""
+
+        from pxr import Usd, UsdGeom
+
+        root = stage.GetPrimAtPath(robot_path)
+        if not root.IsValid():
+            print(f"[RealSim] Active robot not found for visual shell: {robot_path}")
+            return
+
+        hidden = 0
+        for prim in Usd.PrimRange(root):
+            prim_path = str(prim.GetPath())
+            if prim.IsA(UsdGeom.Mesh) and "/visuals" in prim_path:
+                UsdGeom.Imageable(prim).MakeInvisible()
+                hidden += 1
+        print(
+            f"[RealSim] Hid active robot render meshes: {robot_path} meshes={hidden}",
+            flush=True,
+        )
+
+    @staticmethod
+    def _pose_background_robot_visual(
+        stage,
+        robot_path: str,
+        joint_positions,
+        gripper_open: float,
+        log: bool = True,
+    ) -> None:
+        """Author a fixed Pi0-only pose for the unactuated right robot.
+
+        The background USD contains an articulated Franka in its all-zero
+        pose. Its physics joints are disabled elsewhere, so drive targets
+        cannot pose it. This computes the link transforms from the USD joint
+        frames and writes visual-only transforms before PhysX starts. The
+        left/control articulation is untouched.
+        """
+
+        import math
+
+        from pxr import Gf, UsdGeom, UsdPhysics
+
+        def pose_matrix(position, quat):
+            if hasattr(quat, "GetReal"):
+                quat = Gf.Quatd(
+                    float(quat.GetReal()),
+                    Gf.Vec3d(*[float(value) for value in quat.GetImaginary()]),
+                )
+            else:
+                quat = Gf.Quatd(
+                    float(quat[0]),
+                    Gf.Vec3d(float(quat[1]), float(quat[2]), float(quat[3])),
+                )
+            return Gf.Matrix4d(
+                Gf.Matrix3d(quat),
+                Gf.Vec3d(*[float(value) for value in position]),
+            )
+
+        def axis_rotation(axis, angle_rad):
+            rotation = Gf.Rotation(
+                Gf.Vec3d(*[float(value) for value in axis]),
+                math.degrees(float(angle_rad)),
+            )
+            return Gf.Matrix4d(Gf.Matrix3d(rotation), Gf.Vec3d(0.0, 0.0, 0.0))
+
+        def axis_translation(axis, distance):
+            matrix = Gf.Matrix4d(1.0)
+            matrix.SetTranslate(
+                Gf.Vec3d(*[float(value) * float(distance) for value in axis])
+            )
+            return matrix
+
+        def local_matrix(path):
+            return UsdGeom.Xformable(stage.GetPrimAtPath(path)).GetLocalTransformation()
+
+        def write_matrix(path, matrix):
+            prim = stage.OverridePrim(path)
+            xform = UsdGeom.Xformable(prim)
+            for op in xform.GetOrderedXformOps():
+                if op.GetOpName() == "xformOp:transform:pi0_static_pose":
+                    op.Set(matrix)
+                    return
+            xform.ClearXformOpOrder()
+            xform.AddTransformOp(
+                precision=UsdGeom.XformOp.PrecisionDouble,
+                opSuffix="pi0_static_pose",
+            ).Set(matrix)
+
+        q = [float(value) for value in joint_positions]
+        if len(q) != 7:
+            raise ValueError(
+                "background_right_robot_joint_pos must contain exactly 7 values"
+            )
+
+        # Gf matrices use USD's row-vector convention. This reproduces every
+        # source link transform when q is all zero.
+        link7_path = f"{robot_path}/panda_link7"
+        link7_source = local_matrix(link7_path)
+        link_poses = []
+        parent_pose = Gf.Matrix4d(1.0)
+        for joint_index, joint_angle in enumerate(q, start=1):
+            joint_path = f"{robot_path}/joints/panda_joint{joint_index}"
+            if not stage.GetPrimAtPath(joint_path).IsValid():
+                # franka_mimic.usd keeps each revolute joint below its
+                # preceding link, while the background visual USD collects
+                # them below /joints.
+                joint_path = (
+                    f"{robot_path}/panda_link{joint_index - 1}/"
+                    f"panda_joint{joint_index}"
+                )
+            joint = UsdPhysics.RevoluteJoint(stage.GetPrimAtPath(joint_path))
+            if not joint.GetPrim().IsValid():
+                raise RuntimeError(f"Missing right-arm joint: {joint_path}")
+            frame0 = pose_matrix(
+                joint.GetLocalPos0Attr().Get(), joint.GetLocalRot0Attr().Get()
+            )
+            frame1 = pose_matrix(
+                joint.GetLocalPos1Attr().Get(), joint.GetLocalRot1Attr().Get()
+            )
+            parent_pose = (
+                frame1.GetInverse()
+                * axis_rotation((0.0, 0.0, 1.0), joint_angle)
+                * frame0
+                * parent_pose
+            )
+            link_poses.append(parent_pose)
+            write_matrix(f"{robot_path}/panda_link{joint_index}", parent_pose)
+
+        # Preserve the source finger geometry and apply the rollout open
+        # displacement to each direct finger root.
+        link7_pose = link_poses[-1]
+        wrist_delta = link7_source.GetInverse() * link7_pose
+        for finger_index in (1, 2):
+            joint_path = f"{robot_path}/joints/panda_finger_joint{finger_index}"
+            if not stage.GetPrimAtPath(joint_path).IsValid():
+                joint_path = (
+                    f"{robot_path}/panda_hand/"
+                    f"panda_finger_joint{finger_index}"
+                )
+            joint = UsdPhysics.PrismaticJoint(stage.GetPrimAtPath(joint_path))
+            finger_path = (
+                f"{robot_path}/panda_leftfinger"
+                if finger_index == 1
+                else f"{robot_path}/panda_rightfinger"
+            )
+            frame0 = pose_matrix(
+                joint.GetLocalPos0Attr().Get(), joint.GetLocalRot0Attr().Get()
+            )
+            frame1 = pose_matrix(
+                joint.GetLocalPos1Attr().Get(), joint.GetLocalRot1Attr().Get()
+            )
+            finger_pose = (
+                frame1.GetInverse()
+                * axis_translation((0.0, 1.0, 0.0), gripper_open)
+                * frame0
+                * link7_pose
+            )
+            write_matrix(finger_path, finger_pose)
+
+        fingertip_path = f"{robot_path}/panda_fingertip_centered"
+        write_matrix(fingertip_path, local_matrix(fingertip_path) * wrist_delta)
+        if log:
+            print(
+                "[RealSim] Pi0 background visual pose: "
+                f"q={q} gripper_open={float(gripper_open):.4f} "
+                f"link7_local={tuple(round(float(value), 4) for value in link7_pose.ExtractTranslation())}",
+                flush=True,
+            )
+
+    @staticmethod
+    def _solve_background_robot_endpoint_pose(stage, robot_path: str, cfg) -> None:
+        """Solve one fixed endpoint pose for the visual-only right arm."""
+
+        endpoint_pos = np.asarray(
+            getattr(cfg, "background_right_robot_endpoint_reference_offset_pos", ()),
+            dtype=np.float64,
+        )
+        endpoint_rot = np.asarray(
+            getattr(cfg, "background_right_robot_endpoint_target_rot", ()),
+            dtype=np.float64,
+        )
+        if endpoint_pos.size != 3 or endpoint_rot.size != 9:
+            return
+
+        q_seed = np.asarray(
+            getattr(cfg, "background_right_robot_joint_pos", ()),
+            dtype=np.float64,
+        )
+        if q_seed.size != 7:
+            return
+
+        try:
+            from .pi0_static_right_arm import solve_pose_ik
+
+            q_pose, pos_residual, rot_residual = solve_pose_ik(
+                stage,
+                robot_path,
+                endpoint_pos,
+                endpoint_rot.reshape(3, 3),
+                q_seed.reshape(7),
+                max_iterations=500,
+                nominal_weight=1.0e-5,
+            )
+        except Exception as exc:
+            print(
+                "[RealSim] WARNING: right visual endpoint IK failed; "
+                f"using configured joint pose. {type(exc).__name__}: {exc}",
+                flush=True,
+            )
+            return
+
+        cfg.background_right_robot_joint_pos = tuple(float(value) for value in q_pose)
+        print(
+            "[RealSim] Right visual endpoint IK: "
+            f"target={tuple(float(value) for value in endpoint_pos)} "
+            f"q={np.array2string(q_pose, precision=7)} "
+            f"pos_residual={pos_residual:.6f} m "
+            f"rot_residual={rot_residual:.6f} rad",
+            flush=True,
+        )
+
     def _setup_scene(self):
         # sensors
         # """Initialize simulation scene."""
@@ -290,10 +640,11 @@ class RealSimEnv(ForgeEnv):
         # )
         
          # spawn green screen studio
+        default_background_usd = Path(__file__).resolve().parents[4] / "franka_env_background_edit" / "franka_env.usd"
         env_cfg = sim_utils.UsdFileCfg(
             usd_path=os.environ.get(
                 "TACEX_BACKGROUND_USD",
-                "/home/gujiawei/isaac_env/franka_env_background_edit/franka_env.usd",
+                str(default_background_usd),
             )
         )
 
@@ -308,6 +659,29 @@ class RealSimEnv(ForgeEnv):
             # orientation=( 0.0,0.70711, -0.70711, 0.0),
         )
 
+        if getattr(self.cfg, "pi0_green_table_overlay_enabled", False):
+            self._create_pi0_green_table_overlay()
+            if getattr(self.cfg, "pi0_green_table_wrist_overlay_enabled", False):
+                self._create_pi0_wrist_green_table_overlay()
+        if getattr(self.cfg, "pi0_white_table_overlay_enabled", False):
+            self._create_pi0_white_table_overlay()
+        if getattr(self.cfg, "pi0_reference_cylinder_enabled", False):
+            self._create_pi0_reference_cylinder()
+        if getattr(self.cfg, "pi0_cable_grommets_enabled", False):
+            self._create_pi0_cable_grommets()
+
+        # Some captured backgrounds include a second authored Franka. Paired
+        # replay can remove it before PhysX/Fabric scene finalization so only
+        # the controlled left articulation remains.
+        if getattr(self.cfg, "remove_authored_right_robot", False):
+            authored_right_path = "/World/envs/env_0/franka_env/fr3v2_01"
+            authored_right = self.sim.stage.GetPrimAtPath(authored_right_path)
+            if authored_right.IsValid():
+                self.sim.stage.OverridePrim(authored_right_path).SetActive(False)
+                print(
+                    f"[RealSim] Deactivated authored right robot: {authored_right_path}"
+                )
+
         # The visual background used for the cameras may already contain a
         # static Franka at the same prim path as cfg.robot.  PPO must own the
         # only /Robot/franka articulation; otherwise the static background
@@ -318,6 +692,140 @@ class RealSimEnv(ForgeEnv):
             if background_robot.IsValid():
                 self.sim.stage.RemovePrim(background_robot_path)
                 print(f"[RealSim] Removed static background robot: {background_robot_path}")
+        elif getattr(self.cfg, "background_robot_visual_only", False):
+            self._make_background_robot_visual_only(
+                self.sim.stage,
+                "/World/envs/env_0/franka_env/Robot/franka",
+            )
+
+        if getattr(self.cfg, "replay_left_background_visual_shell", False):
+            left_visual_root = "/World/envs/env_0/franka_env/LeftRobotVisual/Robot"
+            self._spawn_background_robot_visual(
+                self.sim.stage,
+                str(env_cfg.usd_path),
+                "/World/Robot",
+                left_visual_root,
+                (0.0, 0.0, 0.0),
+            )
+            self._make_background_robot_visual_only(
+                self.sim.stage,
+                left_visual_root + "/franka",
+            )
+            self._pose_background_robot_visual(
+                self.sim.stage,
+                left_visual_root + "/franka",
+                self.cfg.ctrl.reset_joints,
+                0.04,
+            )
+
+        if getattr(self.cfg, "background_right_robot_visual_only", False):
+            right_robot_root = "/World/envs/env_0/franka_env/RightRobot/Robot"
+            copy_active_visual = bool(
+                getattr(self.cfg, "background_right_robot_copy_active_visual", False)
+            )
+            if copy_active_visual:
+                right_source_usd = str(
+                    Path(__file__).resolve().parents[4]
+                    / "assets"
+                    / "Factory"
+                    / "franka_mimic.usd"
+                )
+                right_source_prim = "/panda"
+            else:
+                right_source_usd = str(
+                    getattr(
+                        self.cfg,
+                        "background_right_robot_visual_usd",
+                        env_cfg.usd_path,
+                    )
+                )
+                right_source_prim = str(
+                    getattr(
+                        self.cfg,
+                        "background_right_robot_visual_prim",
+                        "/World/Robot",
+                    )
+                )
+            self._spawn_background_robot_visual(
+                self.sim.stage,
+                right_source_usd,
+                right_source_prim,
+                right_robot_root,
+                getattr(self.cfg, "background_right_robot_offset_pos", (0.45, 0.0, 0.0)),
+            )
+            if copy_active_visual:
+                # The factory Franka is referenced after scene creation; load
+                # it before traversing joints and authoring the static pose.
+                self.sim.stage.Load()
+                print(
+                    f"[RealSim] Loaded copied right-arm asset: {right_source_usd}",
+                    flush=True,
+                )
+            if copy_active_visual:
+                self._spawn_pi0_black_gripper_visual(
+                    self.sim.stage,
+                    str(default_background_usd),
+                    right_robot_root + "/franka/panda_hand",
+                )
+            # Convert the configured endpoint target into one fixed q before
+            # stripping physics from the visual-only right-arm copy. The live
+            # PPO left articulation is not involved in this solve.
+            self._solve_background_robot_endpoint_pose(
+                self.sim.stage,
+                right_robot_root + "/franka",
+                self.cfg,
+            )
+            self._make_background_robot_visual_only(
+                self.sim.stage,
+                right_robot_root + "/franka",
+            )
+            right_pose = getattr(self.cfg, "background_right_robot_joint_pos", None)
+            if right_pose is not None and not bool(
+                getattr(self.cfg, "background_right_robot_preposed", False)
+            ):
+                self._pose_background_robot_visual(
+                    self.sim.stage,
+                    right_robot_root + "/franka",
+                    right_pose,
+                    getattr(self.cfg, "background_right_robot_gripper_open", 0.04),
+                )
+
+        # The Pi0 scene uses a precomputed, physics-free right-arm asset.
+        # Its root transform contains the calibrated base orientation; this
+        # wrapper supplies the calibrated base position in franka_env.
+        if getattr(self.cfg, "background_fr3v2_right_robot_visual_only", False):
+            original_right_root = "/World/envs/env_0/franka_env/fr3v2_01"
+            original_right = self.sim.stage.GetPrimAtPath(original_right_root)
+            if original_right.IsValid():
+                self.sim.stage.OverridePrim(original_right_root).SetActive(False)
+
+            right_root = "/World/envs/env_0/franka_env/RightRobot/Robot"
+            right_source = getattr(self, "_pi0_static_right_arm_usd", default_background_usd)
+            self._spawn_background_robot_visual(
+                self.sim.stage,
+                str(right_source),
+                "/Root",
+                right_root,
+                getattr(
+                    self.cfg,
+                    "background_fr3v2_right_robot_pos",
+                    (0.6658084946, -0.08782, 0.0991799997),
+                ),
+            )
+
+        robot_prim_path = getattr(self.cfg.robot, "prim_path", "")
+        if "/ActiveRobot/" in robot_prim_path:
+            active_robot_parent = (
+                "/World/envs/env_0/franka_env/ActiveRobot"
+                if "/franka_env/ActiveRobot/" in robot_prim_path
+                else "/World/envs/env_0/ActiveRobot"
+            )
+            sim_utils.create_prim(
+                active_robot_parent,
+                "Xform",
+                translation=tuple(getattr(self.cfg, "active_robot_base_pos", (0.0, 0.0, 0.0))),
+                orientation=tuple(getattr(self.cfg, "active_robot_base_rot", (1.0, 0.0, 0.0, 0.0))),
+            )
 
         # Replay subclasses may author rigid tool geometry under a robot link
         # before the articulation is constructed. This keeps the tool in the
@@ -328,6 +836,25 @@ class RealSimEnv(ForgeEnv):
             prepare_robot_usd()
 
         self._robot = Articulation(self.cfg.robot)
+        if getattr(self.cfg, "replay_left_background_visual_shell", False):
+            active_robot_path = str(self.cfg.robot.prim_path).replace(
+                "env_.*", "env_0"
+            )
+            self._hide_active_robot_render_meshes(
+                self.sim.stage,
+                active_robot_path,
+            )
+        if getattr(self.cfg, "pi0_black_gripper_visual", False):
+            robot_instance_path = "/World/envs/env_0/franka_env/Robot/franka"
+            if "/ActiveRobot/" in getattr(self.cfg.robot, "prim_path", ""):
+                robot_instance_path = getattr(self.cfg.robot, "prim_path", "").replace(
+                    "env_.*", "env_0"
+                )
+            self._spawn_pi0_black_gripper_visual(
+                self.sim.stage,
+                str(Path(__file__).resolve().parents[4] / "franka_env_background_edit" / "franka_env.usd"),
+                f"{robot_instance_path}/panda_hand",
+            )
         # Kinematic TAVLA mode uses a second Franka only as a collision-free
         # kinematic model. It is spawned outside the camera view and never
         # receives task commands.
@@ -345,6 +872,25 @@ class RealSimEnv(ForgeEnv):
             self._large_gear_asset = Articulation(self.cfg_task.large_gear_cfg)
 
         self.scene.clone_environments(copy_from_source=False)
+        if (
+            getattr(self.cfg, "remove_background_robot", False)
+            and "/Robot/franka" not in getattr(self.cfg.robot, "prim_path", "")
+        ):
+            duplicated_background_path = "/World/envs/env_0/franka_env/Robot/franka"
+            duplicated_background = self.sim.stage.GetPrimAtPath(duplicated_background_path)
+            if duplicated_background.IsValid():
+                self.sim.stage.OverridePrim(duplicated_background_path).SetActive(False)
+                print(f"[RealSim] Disabled duplicated background robot: {duplicated_background_path}")
+        if getattr(self.cfg, "background_robot_visual_only", False):
+            self._make_background_robot_visual_only(
+                self.sim.stage,
+                "/World/envs/env_0/franka_env/Robot/franka",
+            )
+        if getattr(self.cfg, "background_right_robot_visual_only", False):
+            self._make_background_robot_visual_only(
+                self.sim.stage,
+                "/World/envs/env_0/franka_env/RightRobot/Robot/franka",
+            )
         if hasattr(self, "_tavla_twin_robot"):
             # The twin is a purely kinematic coordinate frame. Keep it out of
             # camera images and contact dynamics while retaining its PhysX
@@ -377,8 +923,16 @@ class RealSimEnv(ForgeEnv):
         if self.cfg.override_fixed_asset_color:
             self._override_asset_visual_color("FixedAsset", self.cfg.fixed_asset_visual_color)
 
-        # add lights
-        light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
+        # Pi0 visual matching can opt into one explicit light. The imported
+        # background USD currently contains two RectLights and one DistantLight
+        # in addition to this light, which makes the RGB observation much
+        # brighter than the real camera image.
+        if getattr(self.cfg, "pi0_disable_background_lights", False):
+            self._disable_background_lights_for_pi0()
+        light_cfg = sim_utils.DomeLightCfg(
+            intensity=float(getattr(self.cfg, "pi0_dome_light_intensity", 2000.0)),
+            color=tuple(getattr(self.cfg, "pi0_dome_light_color", (0.75, 0.75, 0.75))),
+        )
         light_cfg.func("/World/Light", light_cfg)
         
 
@@ -402,6 +956,9 @@ class RealSimEnv(ForgeEnv):
         if enable_camera_sensors and hasattr(self.cfg, "tiled_camera") and self.cfg.tiled_camera is not None:
             self.tiled_camera = self.cfg.tiled_camera.class_type(self.cfg.tiled_camera)
             self.scene.sensors["tiled_camera"] = self.tiled_camera
+
+        if getattr(self.cfg, "pi0_disable_background_lights", False):
+            self._apply_pi0_camera_exposure()
         
     def _override_asset_visual_color(self, asset_name: str, color: tuple[float, float, float]):
         from pxr import Gf, Sdf, UsdGeom, UsdShade
@@ -423,6 +980,965 @@ class RealSimEnv(ForgeEnv):
                 continue
             UsdShade.MaterialBindingAPI.Apply(prim).Bind(material)
 
+    def _create_pi0_green_table_overlay(self) -> None:
+        """Create the green tabletop from its annotated front-view hexagon."""
+
+        from pxr import Gf, Sdf, Usd, UsdGeom, UsdShade
+
+        image_polygon = tuple(
+            (float(point[0]), float(point[1]))
+            for point in getattr(
+                self.cfg,
+                "pi0_green_table_overlay_image_polygon",
+                (),
+            )
+        )
+        if len(image_polygon) != 6:
+            raise ValueError(
+                "pi0_green_table_overlay_image_polygon must contain six pixels"
+            )
+
+        hole_pos = getattr(
+            self.cfg.task.fixed_asset.init_state,
+            "pos",
+            (0.0, 0.0, 0.0),
+        )
+        surface_z = float(hole_pos[2]) + float(
+            getattr(self.cfg, "pi0_green_table_overlay_z_offset", -0.003)
+        )
+        stage = self.sim.stage
+        camera_prim = next(
+            (
+                prim
+                for prim in stage.Traverse()
+                if prim.GetTypeName() == "Camera"
+                and str(prim.GetPath()).endswith("/front_camera")
+            ),
+            None,
+        )
+        if camera_prim is None:
+            raise RuntimeError(
+                "Cannot create green tabletop: front_camera prim was not found"
+            )
+
+        camera = UsdGeom.Camera(camera_prim)
+        width = float(getattr(self.cfg, "pi0_visual_annotation_width", 640))
+        height = float(getattr(self.cfg, "pi0_visual_annotation_height", 480))
+        focal_length = float(camera.GetFocalLengthAttr().Get())
+        horizontal_aperture = float(camera.GetHorizontalApertureAttr().Get())
+        vertical_aperture = float(camera.GetVerticalApertureAttr().Get())
+        if min(width, height, focal_length, horizontal_aperture, vertical_aperture) <= 0.0:
+            raise ValueError("Invalid front-camera projection parameters")
+
+        fx = width * focal_length / horizontal_aperture
+        fy = height * focal_length / vertical_aperture
+        cx = 0.5 * width
+        cy = 0.5 * height
+        camera_to_world = UsdGeom.Xformable(camera_prim).ComputeLocalToWorldTransform(
+            Usd.TimeCode.Default()
+        )
+        camera_origin = camera_to_world.Transform(Gf.Vec3d(0.0, 0.0, 0.0))
+        def project_pixels(pixel_polygon, target_z):
+            world_polygon = []
+            for pixel_x, pixel_y in pixel_polygon:
+                ray_local = Gf.Vec3d(
+                    (pixel_x - cx) / fx,
+                    -(pixel_y - cy) / fy,
+                    -1.0,
+                )
+                ray_world = camera_to_world.TransformDir(ray_local)
+                ray_z = float(ray_world[2])
+                if abs(ray_z) < 1.0e-8:
+                    raise ValueError(
+                        "Front-camera ray is parallel to the green tabletop"
+                    )
+                distance = (target_z - float(camera_origin[2])) / ray_z
+                if distance <= 0.0:
+                    raise ValueError(
+                        "Green-table image corner lies behind the front camera"
+                    )
+                world_polygon.append(camera_origin + ray_world * distance)
+            return world_polygon
+
+        parent_path = "/World/envs/env_0/pi0_visual_matching"
+        material_path = f"{parent_path}/green_table_material"
+        material = UsdShade.Material.Define(stage, material_path)
+        shader = UsdShade.Shader.Define(stage, f"{material_path}/PreviewSurface")
+        shader.CreateIdAttr("UsdPreviewSurface")
+        shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(
+            Gf.Vec3f(
+                *tuple(
+                    float(value)
+                    for value in getattr(
+                        self.cfg,
+                        "pi0_green_table_overlay_color",
+                        (0.002, 0.025, 0.018),
+                    )
+                )
+            )
+        )
+        shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(
+            float(getattr(self.cfg, "pi0_green_table_overlay_roughness", 0.85))
+        )
+        shader.CreateInput("metallic", Sdf.ValueTypeNames.Float).Set(0.0)
+        material.CreateSurfaceOutput().ConnectToSource(
+            shader.ConnectableAPI(), "surface"
+        )
+
+        def clip_half_plane(polygon, axis: int, bound: float, keep_greater: bool):
+            """Clip a convex image polygon against one axis-aligned boundary."""
+
+            if not polygon:
+                return []
+            clipped = []
+            previous = polygon[-1]
+            previous_inside = (
+                previous[axis] >= bound if keep_greater else previous[axis] <= bound
+            )
+            for current in polygon:
+                current_inside = (
+                    current[axis] >= bound if keep_greater else current[axis] <= bound
+                )
+                if current_inside != previous_inside:
+                    denominator = current[axis] - previous[axis]
+                    if abs(denominator) > 1.0e-8:
+                        blend = (bound - previous[axis]) / denominator
+                        clipped.append(
+                            (
+                                previous[0] + blend * (current[0] - previous[0]),
+                                previous[1] + blend * (current[1] - previous[1]),
+                            )
+                        )
+                if current_inside:
+                    clipped.append(current)
+                previous = current
+                previous_inside = current_inside
+            return clipped
+
+        def clip_rect(polygon, xmin, xmax, ymin, ymax):
+            result = list(polygon)
+            for axis, bound, keep_greater in (
+                (0, xmin, True),
+                (0, xmax, False),
+                (1, ymin, True),
+                (1, ymax, False),
+            ):
+                result = clip_half_plane(result, axis, bound, keep_greater)
+            return result
+
+        def create_region(name: str, pixel_region):
+            if len(pixel_region) < 3:
+                return
+            region = UsdGeom.Mesh.Define(stage, f"{parent_path}/{name}")
+            # Pixel points are clockwise. Reverse them for an upward-facing mesh.
+            region.CreatePointsAttr(list(reversed(project_pixels(pixel_region, surface_z))))
+            region.CreateFaceVertexCountsAttr([len(pixel_region)])
+            region.CreateFaceVertexIndicesAttr(list(range(len(pixel_region))))
+            region.CreateNormalsAttr([Gf.Vec3f(0.0, 0.0, 1.0)])
+            region.SetNormalsInterpolation("uniform")
+            UsdShade.MaterialBindingAPI(region.GetPrim()).Bind(material)
+
+        cutout = tuple(
+            float(value)
+            for value in getattr(
+                self.cfg,
+                "pi0_green_table_hole_cutout_xyxy",
+                (),
+            )
+        )
+        if len(cutout) == 4:
+            left, top, right, bottom = cutout
+            if not left < right or not top < bottom:
+                raise ValueError("green-table hole cutout must satisfy x0 < x1 and y0 < y1")
+            # Four non-overlapping clipped regions leave the hole's screen
+            # region untouched while fully covering the rest of the hexagon.
+            infinity = 1.0e9
+            regions = (
+                ("green_table_top", clip_rect(image_polygon, -infinity, infinity, -infinity, top)),
+                ("green_table_bottom", clip_rect(image_polygon, -infinity, infinity, bottom, infinity)),
+                ("green_table_left", clip_rect(image_polygon, -infinity, left, top, bottom)),
+                ("green_table_right", clip_rect(image_polygon, right, infinity, top, bottom)),
+            )
+            for name, pixel_region in regions:
+                create_region(name, pixel_region)
+        elif len(cutout) == 0:
+            create_region("green_table", image_polygon)
+        else:
+            raise ValueError("pi0_green_table_hole_cutout_xyxy must have four values")
+
+        if getattr(self.cfg, "pi0_green_table_right_patch_enabled", False):
+            right_patch_polygon = tuple(
+                (float(point[0]), float(point[1]))
+                for point in getattr(
+                    self.cfg,
+                    "pi0_green_table_right_patch_image_polygon",
+                    (),
+                )
+            )
+            if len(right_patch_polygon) < 3:
+                raise ValueError(
+                    "pi0_green_table_right_patch_image_polygon needs at least 3 pixels"
+                )
+            right_patch_z = float(hole_pos[2]) + float(
+                getattr(self.cfg, "pi0_green_table_right_patch_z_offset", 0.001)
+            )
+            right_patch_points = project_pixels(right_patch_polygon, right_patch_z)
+            right_patch = UsdGeom.Mesh.Define(
+                stage,
+                f"{parent_path}/green_table_right_patch",
+            )
+            right_patch.CreatePointsAttr(list(reversed(right_patch_points)))
+            right_patch.CreateFaceVertexCountsAttr([len(right_patch_points)])
+            right_patch.CreateFaceVertexIndicesAttr(
+                list(range(len(right_patch_points)))
+            )
+            right_patch.CreateNormalsAttr([Gf.Vec3f(0.0, 0.0, 1.0)])
+            right_patch.SetNormalsInterpolation("uniform")
+            UsdShade.MaterialBindingAPI(right_patch.GetPrim()).Bind(material)
+
+        print(
+            "[Pi0Visual] Created green-table overlay: "
+            f"image_polygon={image_polygon} cutout={cutout or None} "
+            f"surface_z={surface_z:.6f}",
+            flush=True,
+        )
+
+    def _create_pi0_wrist_green_table_overlay(self) -> None:
+        """Create one static, wrist-only green tabletop coverage mesh.
+
+        The normal green tabletop is sized from the annotated front image and
+        must stay tight for the front-camera match.  The wrist camera moves
+        with the hand and can see beyond that polygon, so this mesh expands
+        the same horizontal tabletop footprint in world XY.  It is authored
+        once during scene setup; camera observations only toggle its
+        visibility before an already-required camera render.
+        """
+
+        from pxr import Gf, Sdf, Usd, UsdGeom, UsdShade
+
+        stage = self.sim.stage
+        parent_path = "/World/envs/env_0/pi0_visual_matching"
+        material_path = f"{parent_path}/green_table_material"
+        material = UsdShade.Material.Get(stage, material_path)
+        if not material.GetPrim().IsValid():
+            raise RuntimeError(
+                "Cannot create wrist green-table overlay before the base green-table material"
+            )
+
+        image_polygon = tuple(
+            (float(point[0]), float(point[1]))
+            for point in getattr(
+                self.cfg,
+                "pi0_green_table_overlay_image_polygon",
+                (),
+            )
+        )
+        if len(image_polygon) < 3:
+            raise ValueError(
+                "pi0_green_table_overlay_image_polygon needs at least three pixels"
+            )
+
+        hole_pos = getattr(
+            self.cfg.task.fixed_asset.init_state,
+            "pos",
+            (0.0, 0.0, 0.0),
+        )
+        surface_z = float(hole_pos[2]) + float(
+            getattr(self.cfg, "pi0_green_table_wrist_overlay_z_offset", -0.006)
+        )
+        camera_prim = next(
+            (
+                prim
+                for prim in stage.Traverse()
+                if prim.GetTypeName() == "Camera"
+                and str(prim.GetPath()).endswith("/front_camera")
+            ),
+            None,
+        )
+        if camera_prim is None:
+            raise RuntimeError(
+                "Cannot create wrist green-table overlay: front-camera prim was not found"
+            )
+
+        camera = UsdGeom.Camera(camera_prim)
+        width = float(getattr(self.cfg, "pi0_visual_annotation_width", 640))
+        height = float(getattr(self.cfg, "pi0_visual_annotation_height", 480))
+        focal_length = float(camera.GetFocalLengthAttr().Get())
+        horizontal_aperture = float(camera.GetHorizontalApertureAttr().Get())
+        vertical_aperture = float(camera.GetVerticalApertureAttr().Get())
+        if min(width, height, focal_length, horizontal_aperture, vertical_aperture) <= 0.0:
+            raise ValueError("Invalid front-camera projection parameters")
+
+        fx = width * focal_length / horizontal_aperture
+        fy = height * focal_length / vertical_aperture
+        cx = 0.5 * width
+        cy = 0.5 * height
+        camera_to_world = UsdGeom.Xformable(camera_prim).ComputeLocalToWorldTransform(
+            Usd.TimeCode.Default()
+        )
+        camera_origin = camera_to_world.Transform(Gf.Vec3d(0.0, 0.0, 0.0))
+        table_points = []
+        for pixel_x, pixel_y in image_polygon:
+            ray_local = Gf.Vec3d(
+                (pixel_x - cx) / fx,
+                -(pixel_y - cy) / fy,
+                -1.0,
+            )
+            ray_world = camera_to_world.TransformDir(ray_local)
+            ray_z = float(ray_world[2])
+            if abs(ray_z) < 1.0e-8:
+                raise ValueError(
+                    "Wrist green-table projection ray is parallel to the tabletop"
+                )
+            distance = (surface_z - float(camera_origin[2])) / ray_z
+            if distance <= 0.0:
+                raise ValueError(
+                    "Wrist green-table projection lies behind the front camera"
+                )
+            point = camera_origin + ray_world * distance
+            table_points.append(point)
+
+        margin = float(
+            getattr(self.cfg, "pi0_green_table_wrist_overlay_margin_m", 0.35)
+        )
+        if margin < 0.0:
+            raise ValueError("pi0_green_table_wrist_overlay_margin_m must be non-negative")
+        x_values = [float(point[0]) for point in table_points]
+        y_values = [float(point[1]) for point in table_points]
+        wrist_points = [
+            Gf.Vec3d(min(x_values) - margin, min(y_values) - margin, surface_z),
+            Gf.Vec3d(max(x_values) + margin, min(y_values) - margin, surface_z),
+            Gf.Vec3d(max(x_values) + margin, max(y_values) + margin, surface_z),
+            Gf.Vec3d(min(x_values) - margin, max(y_values) + margin, surface_z),
+        ]
+
+        overlay_path = f"{parent_path}/green_table_wrist"
+        overlay = UsdGeom.Mesh.Define(stage, overlay_path)
+        overlay.CreatePointsAttr(list(reversed(wrist_points)))
+        overlay.CreateFaceVertexCountsAttr([len(wrist_points)])
+        overlay.CreateFaceVertexIndicesAttr(list(range(len(wrist_points))))
+        overlay.CreateNormalsAttr([Gf.Vec3f(0.0, 0.0, 1.0)])
+        overlay.SetNormalsInterpolation("uniform")
+        UsdShade.MaterialBindingAPI(overlay.GetPrim()).Bind(material)
+
+        # Keep the larger mesh out of the front render.  _camera_observation
+        # makes it visible only while updating the wrist camera and then
+        # leaves the captured wrist tensor intact for data recording.
+        UsdGeom.Imageable(overlay.GetPrim()).MakeInvisible()
+        self._pi0_wrist_green_table_overlay_path = overlay_path
+        print(
+            "[Pi0Visual] Created static wrist green-table overlay: "
+            f"margin_m={margin:.3f} surface_z={surface_z:.6f}",
+            flush=True,
+        )
+
+    def _create_pi0_white_table_overlay(self) -> None:
+        """Create the Pi0-only white tabletop using the real-view boundary."""
+
+        from pxr import Gf, Sdf, Usd, UsdGeom, UsdShade
+
+        hole_pos = getattr(
+            self.cfg.task.fixed_asset.init_state,
+            "pos",
+            (0.0, 0.0, 0.0),
+        )
+        hole_z = float(hole_pos[2])
+        surface_z = hole_z + float(
+            getattr(self.cfg, "pi0_white_table_overlay_z_offset", -0.009)
+        )
+
+        stage = self.sim.stage
+        parent_path = "/World/envs/env_0/pi0_visual_matching"
+        region_path = f"{parent_path}/white_table"
+
+        image_polygon = getattr(self.cfg, "pi0_white_table_overlay_image_polygon", ())
+        image_polygon = tuple(
+            (float(point[0]), float(point[1])) for point in image_polygon
+        )
+
+        # Convert the annotated front-camera pixels to a horizontal world
+        # plane.  The background camera is authored in the imported USD, so
+        # its actual transform must be queried after the background is loaded
+        # rather than duplicated in the Pi0 config.
+        camera_prim = next(
+            (
+                prim
+                for prim in stage.Traverse()
+                if prim.GetTypeName() == "Camera"
+                and str(prim.GetPath()).endswith("/front_camera")
+            ),
+            None,
+        )
+        world_points = []
+        if len(image_polygon) == 4 and camera_prim is not None:
+            camera = UsdGeom.Camera(camera_prim)
+            width = float(getattr(self.cfg, "pi0_visual_annotation_width", 640))
+            height = float(getattr(self.cfg, "pi0_visual_annotation_height", 480))
+            focal_length = float(camera.GetFocalLengthAttr().Get())
+            horizontal_aperture = float(camera.GetHorizontalApertureAttr().Get())
+            vertical_aperture = float(camera.GetVerticalApertureAttr().Get())
+            if min(
+                width,
+                height,
+                focal_length,
+                horizontal_aperture,
+                vertical_aperture,
+            ) <= 0.0:
+                raise ValueError("Invalid front-camera projection parameters")
+
+            fx = width * focal_length / horizontal_aperture
+            fy = height * focal_length / vertical_aperture
+            cx = 0.5 * width
+            cy = 0.5 * height
+            camera_to_world = UsdGeom.Xformable(camera_prim).ComputeLocalToWorldTransform(
+                Usd.TimeCode.Default()
+            )
+            camera_origin = camera_to_world.Transform(Gf.Vec3d(0.0, 0.0, 0.0))
+            for pixel_x, pixel_y in image_polygon:
+                ray_local = Gf.Vec3d(
+                    (pixel_x - cx) / fx,
+                    -(pixel_y - cy) / fy,
+                    -1.0,
+                )
+                ray_world = camera_to_world.TransformDir(ray_local)
+                ray_z = float(ray_world[2])
+                if abs(ray_z) < 1.0e-8:
+                    raise ValueError(
+                        "Front-camera ray is parallel to the white tabletop plane"
+                    )
+                distance = (surface_z - float(camera_origin[2])) / ray_z
+                if distance <= 0.0:
+                    raise ValueError(
+                        "White-table image corner lies behind the front camera"
+                    )
+                world_points.append(camera_origin + ray_world * distance)
+        else:
+            x0, x1, y0, y1 = tuple(
+                float(value)
+                for value in getattr(
+                    self.cfg,
+                    "pi0_white_table_overlay_bounds",
+                    (-0.38, 0.85, -0.335, 0.40),
+                )
+            )
+            if not (x1 > x0 and y1 > y0):
+                raise ValueError(
+                    "pi0_white_table_overlay_bounds must be (x0, x1, y0, y1)"
+                )
+            world_points = [
+                Gf.Vec3d(x0, y0, surface_z),
+                Gf.Vec3d(x1, y0, surface_z),
+                Gf.Vec3d(x1, y1, surface_z),
+                Gf.Vec3d(x0, y1, surface_z),
+            ]
+
+        # Image order is top-left, top-right, bottom-right, bottom-left.  A
+        # positive-Z mesh normal needs the reverse order in world XY.
+        region = UsdGeom.Mesh.Define(stage, region_path)
+        region.CreatePointsAttr(
+            [world_points[3], world_points[2], world_points[1], world_points[0]]
+        )
+        region.CreateFaceVertexCountsAttr([4])
+        region.CreateFaceVertexIndicesAttr([0, 1, 2, 3])
+        region.CreateNormalsAttr([Gf.Vec3f(0.0, 0.0, 1.0)])
+        region.SetNormalsInterpolation("uniform")
+
+        material_path = f"{parent_path}/white_table_material"
+        material = UsdShade.Material.Define(stage, material_path)
+        shader = UsdShade.Shader.Define(stage, f"{material_path}/PreviewSurface")
+        shader.CreateIdAttr("UsdPreviewSurface")
+        shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(
+            Gf.Vec3f(
+                *tuple(
+                    float(value)
+                    for value in getattr(
+                        self.cfg,
+                        "pi0_white_table_overlay_color",
+                        (0.25, 0.25, 0.30),
+                    )
+                )
+            )
+        )
+        shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(
+            float(getattr(self.cfg, "pi0_white_table_overlay_roughness", 0.90))
+        )
+        shader.CreateInput("metallic", Sdf.ValueTypeNames.Float).Set(0.0)
+        material.CreateSurfaceOutput().ConnectToSource(
+            shader.ConnectableAPI(), "surface"
+        )
+        UsdShade.MaterialBindingAPI(region.GetPrim()).Bind(material)
+
+        print(
+            "[Pi0Visual] Created white-table overlay: "
+            f"image_polygon={image_polygon} "
+            f"world_points={[tuple(round(float(v), 6) for v in point) for point in world_points]} "
+            f"surface_z={surface_z:.6f} "
+            f"color={tuple(getattr(self.cfg, 'pi0_white_table_overlay_color', (0.25, 0.25, 0.30)))}",
+            flush=True,
+        )
+
+    def _create_pi0_cable_grommets(self) -> None:
+        """Create two flush, visual-only flexible cable grommets."""
+
+        from pxr import Gf, Sdf, Usd, UsdGeom, UsdShade
+
+        stage = self.sim.stage
+        camera_prim = next(
+            (
+                prim
+                for prim in stage.Traverse()
+                if prim.GetTypeName() == "Camera"
+                and str(prim.GetPath()).endswith("/front_camera")
+            ),
+            None,
+        )
+        if camera_prim is None:
+            raise RuntimeError("Cannot place Pi0 cable grommets: front_camera was not found")
+
+        camera = UsdGeom.Camera(camera_prim)
+        width = float(getattr(self.cfg, "pi0_visual_annotation_width", 640))
+        height = float(getattr(self.cfg, "pi0_visual_annotation_height", 480))
+        focal_length = float(camera.GetFocalLengthAttr().Get())
+        horizontal_aperture = float(camera.GetHorizontalApertureAttr().Get())
+        vertical_aperture = float(camera.GetVerticalApertureAttr().Get())
+        fx = width * focal_length / horizontal_aperture
+        fy = height * focal_length / vertical_aperture
+        camera_to_world = UsdGeom.Xformable(camera_prim).ComputeLocalToWorldTransform(
+            Usd.TimeCode.Default()
+        )
+        camera_origin = camera_to_world.Transform(Gf.Vec3d(0.0, 0.0, 0.0))
+        hole_pos = getattr(self.cfg.task.fixed_asset.init_state, "pos", (0.0, 0.0, 0.0))
+        surface_z = float(hole_pos[2]) + float(
+            getattr(self.cfg, "pi0_cable_grommet_surface_z_offset", -0.0147)
+        )
+
+        def material(path: str, color):
+            result = UsdShade.Material.Define(stage, path)
+            shader = UsdShade.Shader.Define(stage, f"{path}/PreviewSurface")
+            shader.CreateIdAttr("UsdPreviewSurface")
+            shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(
+                Gf.Vec3f(*[float(value) for value in color])
+            )
+            shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(0.92)
+            shader.CreateInput("metallic", Sdf.ValueTypeNames.Float).Set(0.0)
+            result.CreateSurfaceOutput().ConnectToSource(shader.ConnectableAPI(), "surface")
+            return result
+
+        root_path = "/World/envs/env_0/pi0_visual_matching/cable_grommets"
+        outer_material = material(
+            f"{root_path}/outer_material", self.cfg.pi0_cable_grommet_outer_color
+        )
+        inner_material = material(
+            f"{root_path}/inner_material", self.cfg.pi0_cable_grommet_inner_color
+        )
+        slit_material = material(
+            f"{root_path}/slit_material", self.cfg.pi0_cable_grommet_slit_color
+        )
+        outer_radius = float(self.cfg.pi0_cable_grommet_outer_radius_m)
+        inner_radius = float(self.cfg.pi0_cable_grommet_inner_radius_m)
+        disc_height = 0.00020
+
+        for index, (pixel_x, pixel_y) in enumerate(self.cfg.pi0_cable_grommet_center_pixels):
+            ray_local = Gf.Vec3d(
+                (float(pixel_x) - 0.5 * width) / fx,
+                -(float(pixel_y) - 0.5 * height) / fy,
+                -1.0,
+            )
+            ray_world = camera_to_world.TransformDir(ray_local)
+            if abs(float(ray_world[2])) < 1.0e-8:
+                raise ValueError("Cable-grommet ray is parallel to the tabletop")
+            distance = (surface_z - float(camera_origin[2])) / float(ray_world[2])
+            if distance <= 0.0:
+                raise ValueError("Cable-grommet pixel lies behind the front camera")
+            center = camera_origin + ray_world * distance
+            item_path = f"{root_path}/grommet_{index}"
+            item = UsdGeom.Xform.Define(stage, item_path)
+            item.AddTranslateOp().Set(
+                Gf.Vec3d(float(center[0]), float(center[1]), surface_z)
+            )
+
+            for name, radius, z_value, bound_material in (
+                ("outer_ring", outer_radius, 0.5 * disc_height, outer_material),
+                ("soft_center", inner_radius, 1.5 * disc_height, inner_material),
+            ):
+                cylinder = UsdGeom.Cylinder.Define(stage, f"{item_path}/{name}")
+                cylinder.CreateAxisAttr(UsdGeom.Tokens.z)
+                cylinder.CreateRadiusAttr(radius)
+                cylinder.CreateHeightAttr(disc_height)
+                UsdGeom.Xformable(cylinder.GetPrim()).AddTranslateOp().Set(
+                    Gf.Vec3d(0.0, 0.0, z_value)
+                )
+                cylinder.GetPrim().CreateAttribute(
+                    "primvars:doNotCastShadows", Sdf.ValueTypeNames.Bool
+                ).Set(True)
+                UsdShade.MaterialBindingAPI(cylinder.GetPrim()).Bind(bound_material)
+
+            slit_length = 0.030
+            slit_width = 0.0011
+            slit_height = 0.00008
+            for slit_index, angle_deg in enumerate((0.0, 90.0)):
+                slit = UsdGeom.Cube.Define(stage, f"{item_path}/slit_{slit_index}")
+                slit.CreateSizeAttr(1.0)
+                slit_xform = UsdGeom.Xformable(slit.GetPrim())
+                slit_xform.AddTranslateOp().Set(
+                    Gf.Vec3d(0.0, 0.0, 2.0 * disc_height + 0.5 * slit_height)
+                )
+                slit_xform.AddRotateZOp().Set(angle_deg)
+                slit_xform.AddScaleOp().Set(
+                    Gf.Vec3d(slit_length, slit_width, slit_height)
+                )
+                slit.GetPrim().CreateAttribute(
+                    "primvars:doNotCastShadows", Sdf.ValueTypeNames.Bool
+                ).Set(True)
+                UsdShade.MaterialBindingAPI(slit.GetPrim()).Bind(slit_material)
+
+        print(
+            "[RealSim] Added visual-only cable grommets at front pixels: "
+            f"{tuple(self.cfg.pi0_cable_grommet_center_pixels)}"
+        )
+
+    def _create_pi0_reference_cylinder(self) -> None:
+        """Create the real-scene black tube and silver flange as visual geometry."""
+
+        from pxr import Gf, Sdf, Usd, UsdGeom, UsdShade
+
+        stage = self.sim.stage
+        camera_prim = next(
+            (
+                prim
+                for prim in stage.Traverse()
+                if prim.GetTypeName() == "Camera"
+                and str(prim.GetPath()).endswith("/front_camera")
+            ),
+            None,
+        )
+        if camera_prim is None:
+            raise RuntimeError(
+                "Cannot create Pi0 reference cylinder: front_camera was not found"
+            )
+
+        camera = UsdGeom.Camera(camera_prim)
+        width = float(getattr(self.cfg, "pi0_visual_annotation_width", 640))
+        height = float(getattr(self.cfg, "pi0_visual_annotation_height", 480))
+        focal_length = float(camera.GetFocalLengthAttr().Get())
+        horizontal_aperture = float(camera.GetHorizontalApertureAttr().Get())
+        vertical_aperture = float(camera.GetVerticalApertureAttr().Get())
+        if min(
+            width,
+            height,
+            focal_length,
+            horizontal_aperture,
+            vertical_aperture,
+        ) <= 0.0:
+            raise ValueError("Invalid front-camera projection parameters")
+
+        pixel_x, pixel_y = tuple(
+            float(value)
+            for value in getattr(
+                self.cfg,
+                "pi0_reference_cylinder_base_pixel",
+                (580.0, 361.0),
+            )
+        )
+        hole_pos = getattr(
+            self.cfg.task.fixed_asset.init_state,
+            "pos",
+            (0.0, 0.0, 0.0),
+        )
+        surface_z = float(hole_pos[2]) + float(
+            getattr(
+                self.cfg,
+                "pi0_reference_cylinder_surface_z_offset",
+                -0.0002,
+            )
+        )
+        fx = width * focal_length / horizontal_aperture
+        fy = height * focal_length / vertical_aperture
+        camera_to_world = UsdGeom.Xformable(camera_prim).ComputeLocalToWorldTransform(
+            Usd.TimeCode.Default()
+        )
+        camera_origin = camera_to_world.Transform(Gf.Vec3d(0.0, 0.0, 0.0))
+        ray_local = Gf.Vec3d(
+            (pixel_x - 0.5 * width) / fx,
+            -(pixel_y - 0.5 * height) / fy,
+            -1.0,
+        )
+        ray_world = camera_to_world.TransformDir(ray_local)
+        if abs(float(ray_world[2])) < 1.0e-8:
+            raise ValueError("Reference-cylinder ray is parallel to the tabletop")
+        distance = (surface_z - float(camera_origin[2])) / float(ray_world[2])
+        if distance <= 0.0:
+            raise ValueError("Reference-cylinder pixel lies behind the front camera")
+        base_center = camera_origin + ray_world * distance
+
+        parent_path = "/World/envs/env_0/pi0_visual_matching/reference_cylinder"
+        root = UsdGeom.Xform.Define(stage, parent_path)
+        root.AddTranslateOp().Set(
+            Gf.Vec3d(float(base_center[0]), float(base_center[1]), surface_z)
+        )
+
+        def create_material(path, color, roughness, metallic):
+            material = UsdShade.Material.Define(stage, path)
+            shader = UsdShade.Shader.Define(stage, f"{path}/PreviewSurface")
+            shader.CreateIdAttr("UsdPreviewSurface")
+            shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(
+                Gf.Vec3f(*[float(value) for value in color])
+            )
+            shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(
+                float(roughness)
+            )
+            shader.CreateInput("metallic", Sdf.ValueTypeNames.Float).Set(
+                float(metallic)
+            )
+            material.CreateSurfaceOutput().ConnectToSource(
+                shader.ConnectableAPI(), "surface"
+            )
+            return material
+
+        metal_material = create_material(
+            f"{parent_path}/metal_material",
+            getattr(
+                self.cfg,
+                "pi0_reference_cylinder_metal_color",
+                (0.18, 0.19, 0.18),
+            ),
+            roughness=0.85,
+            metallic=0.0,
+        )
+        black_material = create_material(
+            f"{parent_path}/black_material",
+            getattr(
+                self.cfg,
+                "pi0_reference_cylinder_black_color",
+                (0.006, 0.006, 0.005),
+            ),
+            roughness=0.58,
+            metallic=0.05,
+        )
+        inner_material = create_material(
+            f"{parent_path}/inner_material",
+            getattr(
+                self.cfg,
+                "pi0_reference_cylinder_inner_color",
+                (0.0005, 0.0005, 0.0005),
+            ),
+            roughness=1.0,
+            metallic=0.0,
+        )
+
+        base_radius = float(
+            getattr(self.cfg, "pi0_reference_cylinder_base_radius_m", 0.032)
+        )
+        base_height = float(
+            getattr(self.cfg, "pi0_reference_cylinder_base_height_m", 0.008)
+        )
+        collar_radius = float(
+            getattr(self.cfg, "pi0_reference_cylinder_collar_radius_m", 0.022)
+        )
+        collar_height = float(
+            getattr(self.cfg, "pi0_reference_cylinder_collar_height_m", 0.010)
+        )
+        tube_radius = float(
+            getattr(self.cfg, "pi0_reference_cylinder_tube_radius_m", 0.017)
+        )
+        tube_height = float(
+            getattr(self.cfg, "pi0_reference_cylinder_tube_height_m", 0.052)
+        )
+        inner_radius = float(
+            getattr(self.cfg, "pi0_reference_cylinder_inner_radius_m", 0.0115)
+        )
+        if not (
+            base_radius > collar_radius > tube_radius > inner_radius > 0.0
+            and min(base_height, collar_height, tube_height) > 0.0
+        ):
+            raise ValueError("Invalid Pi0 reference-cylinder dimensions")
+
+        def create_cylinder_mesh(
+            name,
+            radius,
+            cylinder_height,
+            center_z,
+            material,
+            segments=48,
+        ):
+            """Create a closed polygon mesh without an analytic Cylinder prim."""
+
+            radius = float(radius)
+            half_height = 0.5 * float(cylinder_height)
+            center_z = float(center_z)
+            bottom_z = center_z - half_height
+            top_z = center_z + half_height
+            points = [
+                Gf.Vec3f(0.0, 0.0, bottom_z),
+                Gf.Vec3f(0.0, 0.0, top_z),
+            ]
+            for z_value in (bottom_z, top_z):
+                for index in range(segments):
+                    angle = 2.0 * np.pi * float(index) / float(segments)
+                    points.append(
+                        Gf.Vec3f(
+                            radius * float(np.cos(angle)),
+                            radius * float(np.sin(angle)),
+                            z_value,
+                        )
+                    )
+
+            bottom_start = 2
+            top_start = 2 + segments
+            face_counts = []
+            face_indices = []
+            for index in range(segments):
+                next_index = (index + 1) % segments
+                bottom = bottom_start + index
+                bottom_next = bottom_start + next_index
+                top = top_start + index
+                top_next = top_start + next_index
+                # Two side triangles, one bottom cap triangle, and one top
+                # cap triangle. Winding points outward on every surface.
+                face_counts.extend((3, 3, 3, 3))
+                face_indices.extend(
+                    (
+                        bottom,
+                        bottom_next,
+                        top_next,
+                        bottom,
+                        top_next,
+                        top,
+                        0,
+                        bottom_next,
+                        bottom,
+                        1,
+                        top,
+                        top_next,
+                    )
+                )
+
+            mesh = UsdGeom.Mesh.Define(stage, f"{parent_path}/{name}")
+            mesh.CreatePointsAttr(points)
+            mesh.CreateFaceVertexCountsAttr(face_counts)
+            mesh.CreateFaceVertexIndicesAttr(face_indices)
+            mesh.CreateSubdivisionSchemeAttr(UsdGeom.Tokens.none)
+            mesh.CreateExtentAttr(
+                [
+                    Gf.Vec3f(-radius, -radius, bottom_z),
+                    Gf.Vec3f(radius, radius, top_z),
+                ]
+            )
+            # The imported laboratory background is a Gaussian particle
+            # field. Shadows received from ordinary meshes can become large,
+            # noisy splat artifacts in the oblique wrist view. This prop is
+            # visual context only, so keep it visible but exclude it from the
+            # RTX shadow pass.
+            mesh.GetPrim().CreateAttribute(
+                "primvars:doNotCastShadows",
+                Sdf.ValueTypeNames.Bool,
+            ).Set(True)
+            UsdShade.MaterialBindingAPI(mesh.GetPrim()).Bind(material)
+            return mesh
+
+        create_cylinder_mesh(
+            "silver_flange",
+            base_radius,
+            base_height,
+            0.5 * base_height,
+            metal_material,
+        )
+        create_cylinder_mesh(
+            "silver_collar",
+            collar_radius,
+            collar_height,
+            base_height + 0.5 * collar_height,
+            metal_material,
+        )
+        tube_bottom = base_height + collar_height
+        create_cylinder_mesh(
+            "black_tube",
+            tube_radius,
+            tube_height,
+            tube_bottom + 0.5 * tube_height,
+            black_material,
+        )
+        # A recessed near-black disk creates the visible hollow opening while
+        # keeping the object lightweight and free of boolean geometry.
+        create_cylinder_mesh(
+            "tube_inner_dark",
+            inner_radius,
+            0.001,
+            tube_bottom + tube_height + 0.00051,
+            inner_material,
+        )
+
+        print(
+            "[Pi0Visual] Created reference cylinder: "
+            f"base_pixel=({pixel_x:.1f}, {pixel_y:.1f}) "
+            f"base_world=({float(base_center[0]):.6f}, "
+            f"{float(base_center[1]):.6f}, {surface_z:.6f})",
+            flush=True,
+        )
+
+    def _disable_background_lights_for_pi0(self) -> None:
+        """Disable lights authored by the imported background for Pi0 only."""
+
+        from pxr import UsdLux
+
+        disabled = []
+        for prim in self.sim.stage.Traverse():
+            if prim.GetTypeName() not in {
+                "DomeLight",
+                "DistantLight",
+                "RectLight",
+                "SphereLight",
+                "DiskLight",
+                "CylinderLight",
+                "PortalLight",
+            }:
+                continue
+            # The explicit /World/Light is created immediately after this
+            # method, so every light found here belongs to the background.
+            intensity_attr = UsdLux.LightAPI(prim).GetIntensityAttr()
+            if intensity_attr.IsValid():
+                intensity_attr.Set(0.0)
+                disabled.append(str(prim.GetPath()))
+        print(
+            "[Pi0Visual] Disabled background lights: "
+            + (", ".join(disabled) if disabled else "none"),
+            flush=True,
+        )
+
+    def _apply_pi0_camera_exposure(self) -> None:
+        """Apply fixed RTX exposure and disable auto exposure on Pi0 cameras."""
+
+        from pxr import Sdf
+
+        exposure_by_suffix = {
+            "/front_camera": float(getattr(self.cfg, "pi0_front_camera_exposure", -1.0)),
+            "/wrist_camera": float(getattr(self.cfg, "pi0_wrist_camera_exposure", -2.0)),
+        }
+        applied = []
+        for prim in self.sim.stage.Traverse():
+            if prim.GetTypeName() != "Camera":
+                continue
+            path = str(prim.GetPath())
+            exposure = next(
+                (value for suffix, value in exposure_by_suffix.items() if path.endswith(suffix)),
+                None,
+            )
+            if exposure is None:
+                continue
+            prim.AddAppliedSchema("OmniRtxCameraExposureAPI_1")
+            prim.AddAppliedSchema("OmniRtxCameraAutoExposureAPI_1")
+            prim.CreateAttribute("exposure", Sdf.ValueTypeNames.Float).Set(exposure)
+            prim.CreateAttribute(
+                "omni:rtx:autoExposure:enabled",
+                Sdf.ValueTypeNames.Bool,
+            ).Set(False)
+            applied.append(f"{path}={exposure:.2f}EV")
+        print(
+            "[Pi0Visual] Fixed camera exposure: "
+            + (", ".join(applied) if applied else "none"),
+            flush=True,
+        )
+
     def record_data(self, env_idx=None):
         """
         Record simulation data for one or all environments.
@@ -441,21 +1957,24 @@ class RealSimEnv(ForgeEnv):
         if env_idx is not None:
             buf = self.data_buffers[env_idx]
             
-            # Record camera data
-            if hasattr(self, "tiled_camera") and self.tiled_camera is not None:
+            # Raw sensor videos are optional diagnostics. Evaluation saves the
+            # exact policy-input tensors below instead.
+            if self.save_raw_camera_video and hasattr(self, "tiled_camera") and self.tiled_camera is not None:
                 buf["camera"]["front"].append(
                     self.tiled_camera.data.output["rgb"][env_idx].to("cpu").clone()
                 )
-            if hasattr(self, "wrist_tiled_camera") and self.wrist_tiled_camera is not None:
-                buf["camera"]["wrist"].append(
-                    self.wrist_tiled_camera.data.output["rgb"][env_idx].to("cpu").clone()
-                )
-            if getattr(self, "_tavla_visual_frame_ready", False):
+            if self.save_raw_camera_video and hasattr(self, "wrist_tiled_camera") and self.wrist_tiled_camera is not None:
+                wrist_frame = self.wrist_tiled_camera.data.output["rgb"][env_idx].to("cpu").clone()
+                clean_wrist_frame = getattr(self, "_clean_wrist_camera_frame", None)
+                if callable(clean_wrist_frame):
+                    wrist_frame = clean_wrist_frame(wrist_frame)
+                buf["camera"]["wrist"].append(wrist_frame)
+            if self.save_policy_input_video and getattr(self, "_model_visual_frame_ready", False):
                 buf["camera"]["front_transformed"].append(
-                    self.last_tavla_transformed_front.to("cpu").clone()
+                    self.last_model_input_front.to("cpu").clone()
                 )
                 buf["camera"]["wrist_transformed"].append(
-                    self.last_tavla_transformed_wrist.to("cpu").clone()
+                    self.last_model_input_wrist.to("cpu").clone()
                 )
             
             # Record joint states
@@ -521,6 +2040,14 @@ class RealSimEnv(ForgeEnv):
                 buf["tavla_wrench_final"].append(self.wrench_final[env_idx].to("cpu").clone())
                 if hasattr(self, "last_tavla_effort"):
                     buf["tavla_policy_wrench"].append(self.last_tavla_effort[env_idx].to("cpu").clone())
+                if hasattr(self, "last_tavla_force_gate_active"):
+                    buf["tavla_force_gate_active"].append(
+                        float(self.last_tavla_force_gate_active[env_idx].detach().cpu())
+                    )
+                if hasattr(self, "last_tavla_force_gate_contact_norm"):
+                    buf["tavla_force_gate_contact_norm"].append(
+                        float(self.last_tavla_force_gate_contact_norm[env_idx].detach().cpu())
+                    )
                 if hasattr(self, "last_tavla_server_effort"):
                     buf["tavla_server_effort"].append(self.last_tavla_server_effort[env_idx].to("cpu").clone())
                     buf["tavla_server_effort_matches_final"].append(
@@ -582,6 +2109,8 @@ class RealSimEnv(ForgeEnv):
         """
         if not self.collect_data:
             return
+
+        self._model_visual_frame_ready = False
             
         if env_idx is not None:
             self.data_buffers[env_idx] = {
@@ -615,6 +2144,8 @@ class RealSimEnv(ForgeEnv):
                 "tavla_server_effort": [],
                 "tavla_server_effort_matches_final": [],
                 "tavla_policy_wrench": [],
+                "tavla_force_gate_active": [],
+                "tavla_force_gate_contact_norm": [],
                 "tavla_actual_state": [],
                 "tavla_policy_state": [],
                 "tavla_combined_targets": [],
@@ -709,7 +2240,12 @@ class RealSimEnv(ForgeEnv):
 
             # Save camera data as video
             for key, camera_list in buf["camera"].items():
-                if self.minimal_output and key not in {"front", "wrist"}:
+                allowed_camera_keys = set()
+                if self.save_policy_input_video:
+                    allowed_camera_keys.update({"front_transformed", "wrist_transformed"})
+                if self.save_raw_camera_video:
+                    allowed_camera_keys.update({"front", "wrist"})
+                if key not in allowed_camera_keys:
                     continue
                 if len(camera_list) <= 1:
                     continue
@@ -735,9 +2271,8 @@ class RealSimEnv(ForgeEnv):
                         frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
                     video_frames.append(frame)
 
-                if not (self.minimal_output and buf.get("rewards")):
-                    _write_h264_mp4(video_path, video_frames, fps)
-                    print(f"Saved {key} video to {video_path}")
+                _write_h264_mp4(video_path, video_frames, fps)
+                print(f"Saved {key} video to {video_path}")
 
                 # Keep the original camera video untouched and additionally
                 # export a VS Code-friendly H.264 video with the same PPO/
@@ -745,7 +2280,7 @@ class RealSimEnv(ForgeEnv):
                 # post-reset frame.  The first camera frame is the reset
                 # snapshot and has no reward, so reward index i-1 matches
                 # camera frame i.
-                if key in {"front", "wrist"} and buf.get("rewards"):
+                if self.save_reward_video and key in {"front", "wrist"} and buf.get("rewards"):
                     reward_values = [float(value) for value in buf["rewards"]]
                     reward_terms = buf.get("reward_terms", [])
                     overlay_frames = []
@@ -882,6 +2417,8 @@ class RealSimEnv(ForgeEnv):
                 ("tavla_action_nonfinite", "tavla_action_nonfinite.csv", "action_nonfinite"),
                 ("tavla_target_out_of_limits", "tavla_target_out_of_limits.csv", "target_out_of_limits"),
                 ("tavla_policy_wrench", "tavla_policy_wrench.csv", "policy_wrench"),
+                ("tavla_force_gate_active", "tavla_force_gate_active.csv", "gate_active"),
+                ("tavla_force_gate_contact_norm", "tavla_force_gate_contact_norm.csv", "contact_norm_n"),
                 ("tavla_twin_state", "tavla_twin_state.csv", "twin_state"),
                 ("tavla_taskspace_actions", "tavla_taskspace_actions.csv", "taskspace_action"),
                 ("tavla_taskspace_q_deltas", "tavla_taskspace_q_deltas.csv", "taskspace_q_delta"),
@@ -927,6 +2464,17 @@ class RealSimEnv(ForgeEnv):
                     float(value) for value in getattr(self.cfg, "teacher_taskspace_velocity_limits", [])
                 ],
                 "teacher_force_norm_p99": float(getattr(self.cfg, "teacher_force_norm_p99", 0.0)),
+                "tavla_force_gate": {
+                    "enabled": bool(getattr(self.cfg, "tavla_force_gate_enabled", False)),
+                    "threshold_n": float(getattr(self.cfg, "tavla_force_gate_threshold_n", 0.0)),
+                    "confirm_steps": int(getattr(self.cfg, "tavla_force_gate_confirm_steps", 0)),
+                    "release_steps": int(getattr(self.cfg, "tavla_force_gate_release_steps", 0)),
+                    "precontact_wrench": [
+                        float(value)
+                        for value in getattr(self.cfg, "tavla_force_gate_precontact_wrench", [])
+                    ],
+                    "contact_view": "HeldAsset -> FixedAsset PhysX contact report",
+                },
                 "twin_ik_position_error": float(
                     getattr(self, "tavla_twin_ik_position_error", torch.tensor([float("nan")], device=self.device))[0].detach().cpu()
                 ),
@@ -1037,8 +2585,14 @@ class RealSimEnv(ForgeEnv):
         if action is None:
             action = stack_series("tavla_executed_targets")
         timestamps = stack_series("timestamps")
-        front = stack_frames("front")
-        wrist = stack_frames("wrist")
+        # New evaluations store the exact policy inputs. Fall back to the
+        # legacy raw streams so old buffers remain exportable.
+        front = stack_frames("front_transformed")
+        if front is None:
+            front = stack_frames("front")
+        wrist = stack_frames("wrist_transformed")
+        if wrist is None:
+            wrist = stack_frames("wrist")
 
         missing = []
         for name, value in (
@@ -1507,7 +3061,7 @@ class RealSimEnv(ForgeEnv):
 
         # check if we need to do rendering within the physics loop
         # note: checked here once to avoid multiple checks within the loop
-        is_rendering = self.sim.has_gui() or self.sim.has_rtx_sensors()
+        is_rendering = _sim_flag(self.sim, "has_gui") or _sim_flag(self.sim, "has_rtx_sensors")
 
         start = time.time()
         # perform physics stepping
@@ -1596,7 +3150,7 @@ class RealSimEnv(ForgeEnv):
             self.scene.write_data_to_sim()
             self.sim.forward()
             # if sensors are added to the scene, make sure we render to reflect changes in reset
-            if self.sim.has_rtx_sensors() and self.cfg.rerender_on_reset:
+            if _sim_flag(self.sim, "has_rtx_sensors") and self.cfg.rerender_on_reset:
                 self.sim.render()
 
         if self.collect_data and self.cur_num_traj >= self.num_trajectories and not getattr(self.cfg, "teacher_eval_only", False):
@@ -1821,8 +3375,31 @@ class RealSimEnv(ForgeEnv):
         
         return action_list
     
+    def _detach_held_asset(self, env_ids):
+        """Remove the peg attachment before resetting its pose."""
+        if getattr(self.cfg_task, "name", "") != "peg_insert":
+            return
+        from pxr import Sdf
+
+        stage = self.sim.stage
+        for env_id in env_ids.detach().cpu().tolist():
+            joint_path = Sdf.Path(f"/World/envs/env_{int(env_id)}/PegFixedJoint")
+            if stage.GetPrimAtPath(joint_path).IsValid():
+                stage.RemovePrim(joint_path)
+
+    def _attach_held_asset(self, env_ids):
+        """Leave peg as an independent dynamic body held by finger contacts.
+
+        The peg is initialized in the gripper by ``randomize_initial_state``.
+        After reset, PhysX alone advances it; no runtime joint, kinematic flag,
+        or per-step pose write is applied.  This preserves the contact impulse
+        when the peg hits the hole instead of teleporting it through the hole.
+        """
+        return
+
     def _reset_idx(self, env_ids):
         """Perform additional randomizations."""
+        self._detach_held_asset(env_ids)
         super()._reset_idx(env_ids)
         self._cartesian_target_initialized = True
         self._cartesian_target_pos[env_ids] = self.fingertip_midpoint_pos[env_ids].detach()
@@ -1853,14 +3430,31 @@ class RealSimEnv(ForgeEnv):
         # (1.) Randomize fixed asset pose.
         fixed_state = self._fixed_asset.data.default_root_state.clone()[env_ids]
         # (1.a.) Position
-        # [MODIFIED] 使用局部生成器 self.rng
-        rand_sample = torch.rand((len(env_ids), 3), generator=self.rng, dtype=torch.float32, device=self.device)
-        
-        fixed_pos_init_rand = 2 * (rand_sample - 0.5)  # [-1, 1]
-        fixed_asset_init_pos_rand = torch.tensor(
-            self.cfg_task.fixed_asset_init_pos_noise, dtype=torch.float32, device=self.device
-        )
-        fixed_pos_init_rand = fixed_pos_init_rand @ torch.diag(fixed_asset_init_pos_rand)
+        # Evaluators may provide the same per-episode offsets used by the Pi0
+        # randomized evaluator.  With no schedule, preserve the original
+        # seeded randomization exactly.
+        reset_schedule = getattr(self, "tavla_reset_schedule", None)
+        reset_schedule_index = int(getattr(self, "tavla_reset_schedule_index", 0))
+        schedule_row = None
+        if reset_schedule:
+            schedule_row = reset_schedule[min(reset_schedule_index, len(reset_schedule) - 1)]
+            fixed_pos_init_rand = torch.as_tensor(
+                schedule_row["hole_offset_m"], dtype=torch.float32, device=self.device
+            ).view(1, 3).repeat(len(env_ids), 1)
+        else:
+            rand_sample = torch.rand(
+                (len(env_ids), 3), generator=self.rng, dtype=torch.float32, device=self.device
+            )
+            fixed_pos_init_rand = 2 * (rand_sample - 0.5)  # [-1, 1]
+            fixed_asset_init_pos_rand = torch.tensor(
+                self.cfg_task.fixed_asset_init_pos_noise, dtype=torch.float32, device=self.device
+            )
+            fixed_pos_init_rand = fixed_pos_init_rand @ torch.diag(fixed_asset_init_pos_rand)
+        if not hasattr(self, "tavla_last_hole_position_offset_m"):
+            self.tavla_last_hole_position_offset_m = torch.zeros(
+                (self.num_envs, 3), dtype=torch.float32, device=self.device
+            )
+        self.tavla_last_hole_position_offset_m[env_ids] = fixed_pos_init_rand
         fixed_state[:, 0:3] += fixed_pos_init_rand + self.scene.env_origins[env_ids]
         # (1.b.) Orientation
         fixed_orn_init_yaw = np.deg2rad(self.cfg_task.fixed_asset_init_orn_deg)
@@ -1875,6 +3469,11 @@ class RealSimEnv(ForgeEnv):
             fixed_orn_euler[:, 0], fixed_orn_euler[:, 1], fixed_orn_euler[:, 2]
         )
         fixed_state[:, 3:7] = fixed_orn_quat
+        use_pi0_reset_pose = bool(getattr(self.cfg_task, "use_pi0_reset_pose", False))
+        if use_pi0_reset_pose and hasattr(self.cfg, "pi0_hole_init_rot"):
+            fixed_state[:, 3:7] = torch.as_tensor(
+                self.cfg.pi0_hole_init_rot, dtype=torch.float32, device=self.device
+            ).view(1, 4)
         # (1.c.) Velocity
         fixed_state[:, 7:] = 0.0  # vel
         # (1.d.) Update values.
@@ -1915,8 +3514,26 @@ class RealSimEnv(ForgeEnv):
         MAX_ATTEMPTS = 10
         reset_ik_debug = bool(getattr(self.cfg_task, "reset_ik_debug", False))
         debug_print = print if reset_ik_debug else (lambda *args, **kwargs: None)
+        skip_reset_ik = bool(getattr(self.cfg_task, "skip_reset_ik", False))
+        if skip_reset_ik:
+            direct_reset_schedule = getattr(self, "tavla_direct_reset_joints_schedule", None)
+            direct_reset_index = int(getattr(self, "tavla_reset_schedule_index", 0))
+            if direct_reset_schedule:
+                direct_reset_joints = direct_reset_schedule[
+                    min(direct_reset_index, len(direct_reset_schedule) - 1)
+                ]
+                self._set_franka_to_default_pose(
+                    joints=direct_reset_joints,
+                    env_ids=env_ids,
+                )
+                print(
+                    "[RealSim] reset IK skipped; using PI0 direct joints "
+                    f"for episode index {direct_reset_index}."
+                )
+            else:
+                print("[RealSim] reset IK skipped; using reset_joints directly.")
 
-        while True:
+        while not skip_reset_ik:
             n_bad = bad_envs.shape[0]
 
             # ✅ 打印fingertip当前位姿
@@ -1934,10 +3551,22 @@ class RealSimEnv(ForgeEnv):
             debug_print(f"[DEBUG] above_fixed_pos (no noise)[0]: {above_fixed_pos[0].cpu().numpy()}")
 
             # ✅ 加噪声
-            rand_sample = torch.rand((n_bad, 3), generator=self.rng, dtype=torch.float32, device=self.device)
-            above_fixed_pos_rand = 2 * (rand_sample - 0.5)
-            hand_init_pos_rand = torch.tensor(self.cfg_task.hand_init_pos_noise, device=self.device)
-            above_fixed_pos_rand = above_fixed_pos_rand @ torch.diag(hand_init_pos_rand)
+            if schedule_row is not None:
+                above_fixed_pos_rand = torch.as_tensor(
+                    schedule_row["hand_offset_m"], dtype=torch.float32, device=self.device
+                ).view(1, 3).repeat(n_bad, 1)
+            else:
+                rand_sample = torch.rand(
+                    (n_bad, 3), generator=self.rng, dtype=torch.float32, device=self.device
+                )
+                above_fixed_pos_rand = 2 * (rand_sample - 0.5)
+                hand_init_pos_rand = torch.tensor(self.cfg_task.hand_init_pos_noise, device=self.device)
+                above_fixed_pos_rand = above_fixed_pos_rand @ torch.diag(hand_init_pos_rand)
+            if not hasattr(self, "tavla_last_hand_position_offset_m"):
+                self.tavla_last_hand_position_offset_m = torch.zeros(
+                    (self.num_envs, 3), dtype=torch.float32, device=self.device
+                )
+            self.tavla_last_hand_position_offset_m[bad_envs] = above_fixed_pos_rand
             above_fixed_pos[bad_envs] += above_fixed_pos_rand
             debug_print(f"[DEBUG] above_fixed_pos (w/ noise)[0]: {above_fixed_pos[0].cpu().numpy()}")
 
@@ -2001,6 +3630,13 @@ class RealSimEnv(ForgeEnv):
             ik_attempt += 1
 
         self.step_sim_no_action()
+        if schedule_row is not None:
+            # DirectRLEnv performs an internal reset after every completed
+            # episode; consume exactly one schedule row per reset and reuse the
+            # final row only for any cleanup reset after the requested run.
+            self.tavla_reset_schedule_index = min(
+                reset_schedule_index + 1, len(reset_schedule) - 1
+            )
 
         # Add flanking gears after servo (so arm doesn't move them).
         if self.cfg_task.name == "gear_mesh" and self.cfg_task.add_flanking_gears:
@@ -2058,7 +3694,7 @@ class RealSimEnv(ForgeEnv):
         # )
         
         # ================= NEW: 添加旋转随机化 =================
-        if self.cfg_task.name == "peg_insert":
+        if self.cfg_task.name == "peg_insert" and not use_pi0_reset_pose:
             rot_noise_deg = float(getattr(self.cfg_task, "held_asset_rot_noise_deg", 0.0))
             rot_noise_rad = np.deg2rad(rot_noise_deg)
             
@@ -2092,14 +3728,40 @@ class RealSimEnv(ForgeEnv):
                 t2=asset_in_hand_pos
             )
             debug_print("随机位置和旋转")
-        else:
+        elif not use_pi0_reset_pose:
             translated_held_asset_quat, translated_held_asset_pos = torch_utils.tf_combine(
                 q1=translated_held_asset_quat,
                 t1=translated_held_asset_pos,
                 q2=torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.device).unsqueeze(0).repeat(self.num_envs, 1),
                 t2=held_asset_pos_noise,
             )
-            
+
+        if use_pi0_reset_pose:
+            # Use Pi0's IsaacLab-6 XYZW frame chain for the held peg. The
+            # legacy RealSim chain flips the peg into a different position.
+            identity_quat = torch.zeros((self.num_envs, 4), device=self.device)
+            identity_quat[:, 3] = 1.0
+            zero_pos = torch.zeros((self.num_envs, 3), device=self.device)
+            flip_y_quat = torch.zeros((self.num_envs, 4), device=self.device)
+            flip_y_quat[:, 1] = 1.0
+            flipped_pos, flipped_quat = isaaclab_math.combine_frame_transforms(
+                self.fingertip_midpoint_pos,
+                self.fingertip_midpoint_quat,
+                zero_pos,
+                flip_y_quat,
+            )
+            relative_pos = torch.zeros((self.num_envs, 3), device=self.device)
+            relative_pos[:, 2] = (0.050 - 0.017608) + float(
+                getattr(self.cfg, "pi0_peg_mount_depth_adjust_m", 0.0)
+            )
+            translated_held_asset_pos, translated_held_asset_quat = (
+                isaaclab_math.combine_frame_transforms(
+                    flipped_pos,
+                    flipped_quat,
+                    -relative_pos,
+                    identity_quat,
+                )
+            )
 
         held_state = self._held_asset.data.default_root_state.clone()
         held_state[:, 0:3] = translated_held_asset_pos + self.scene.env_origins
@@ -2156,6 +3818,39 @@ class RealSimEnv(ForgeEnv):
             self._held_asset.write_root_pose_to_sim(held_state[env_ids, 0:7], env_ids=env_ids)
             self._held_asset.write_root_velocity_to_sim(held_state[env_ids, 7:], env_ids=env_ids)
             self._held_asset.reset()
+            if use_pi0_reset_pose:
+                identity_quat = torch.zeros((self.num_envs, 4), device=self.device)
+                identity_quat[:, 3] = 1.0
+                zero_pos = torch.zeros((self.num_envs, 3), device=self.device)
+                flip_y_quat = torch.zeros((self.num_envs, 4), device=self.device)
+                flip_y_quat[:, 1] = 1.0
+                flipped_pos, flipped_quat = isaaclab_math.combine_frame_transforms(
+                    self.fingertip_midpoint_pos,
+                    self.fingertip_midpoint_quat,
+                    zero_pos,
+                    flip_y_quat,
+                )
+                relative_pos = torch.zeros((self.num_envs, 3), device=self.device)
+                relative_pos[:, 2] = (0.050 - 0.017608) + float(
+                    getattr(self.cfg, "pi0_peg_mount_depth_adjust_m", 0.0)
+                )
+                snapped_held_asset_pos, snapped_held_asset_quat = (
+                    isaaclab_math.combine_frame_transforms(
+                        flipped_pos,
+                        flipped_quat,
+                        -relative_pos,
+                        identity_quat,
+                    )
+                )
+                held_state[:, 0:3] = snapped_held_asset_pos + self.scene.env_origins
+                held_state[:, 3:7] = snapped_held_asset_quat
+                self._held_asset.write_root_pose_to_sim(
+                    held_state[env_ids, 0:7], env_ids=env_ids
+                )
+                self._held_asset.write_root_velocity_to_sim(
+                    held_state[env_ids, 7:], env_ids=env_ids
+                )
+                self._held_asset.reset()
             self.step_sim_no_action()
 
         grasp_settle_time_s = float(getattr(self.cfg_task, "grasp_settle_time_s", 0.0))
@@ -2164,6 +3859,8 @@ class RealSimEnv(ForgeEnv):
             self.close_gripper_in_place()
             self.step_sim_no_action()
             grasp_settle_time += self.sim.get_physics_dt()
+
+        self._attach_held_asset(env_ids)
 
         self.prev_joint_pos = self.joint_pos[:, 0:7].clone()
         self.prev_fingertip_pos = self.fingertip_midpoint_pos.clone()

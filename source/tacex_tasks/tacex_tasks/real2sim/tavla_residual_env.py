@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import deque
 import json
 import os
 import cv2
@@ -8,17 +9,82 @@ import time
 import gymnasium as gym
 import numpy as np
 import torch
-import isaacsim.core.utils.torch as torch_utils
+import tacex_tasks.torch_compat as torch_utils
 from isaaclab_tasks.direct.factory import factory_control, factory_utils
 
-from .policy.modeling_pi0remote import PI0RemotePolicyTAVLA
+from .pi0_env import (
+    Pi0RealSimEnv,
+    _pi0_wrist_camera_rotation,
+    _sanitize_pi0_wrist_green_overlay,
+)
 from .realsim_env import RealSimEnv
+
+
+def _configure_pi0_rollout_scene(cfg) -> None:
+    """Apply the already-validated Pi0 scene/control setup to TAVLA.
+
+    TAVLA is a force-conditioned Pi0 checkpoint.  Its only deployment
+    difference is the extra wrench field; camera, background, reset frame and
+    control period must therefore remain identical to Pi0.
+    """
+    cfg.enable_cameras = True
+    cfg.decimation = 12  # 1/120 s physics with the validated 10 Hz Pi0 step.
+
+    render_width = int(getattr(cfg, "pi0_camera_render_width", 1280))
+    render_height = int(getattr(cfg, "pi0_camera_render_height", 960))
+    if getattr(cfg, "tiled_camera", None) is not None:
+        cfg.tiled_camera.width = render_width
+        cfg.tiled_camera.height = render_height
+    if getattr(cfg, "wrist_camera", None) is not None:
+        cfg.wrist_camera.width = render_width
+        cfg.wrist_camera.height = render_height
+        if cfg.wrist_camera.spawn is not None:
+            cfg.wrist_camera.spawn.focal_length = float(cfg.pi0_wrist_camera_focal_length)
+            cfg.wrist_camera.spawn.vertical_aperture_offset = float(
+                cfg.pi0_wrist_camera_vertical_aperture_offset
+            )
+            cfg.wrist_camera.spawn.clipping_range = tuple(cfg.pi0_wrist_camera_clipping_range)
+        cfg.wrist_camera.prim_path = (
+            "/World/envs/env_.*/franka_env/Robot/franka/"
+            "panda_link7/panda_link8/panda_hand/wrist_camera"
+        )
+        cfg.wrist_camera.offset.pos = tuple(cfg.pi0_wrist_camera_offset_pos)
+        cfg.wrist_camera.offset.rot = _pi0_wrist_camera_rotation(cfg)
+        cfg.wrist_camera.offset.convention = "opengl"
+
+    # These flags are consumed by RealSimEnv._setup_scene() before PhysX
+    # finalization and reproduce the Pi0 background exactly.
+    cfg.remove_background_robot = True
+    cfg.background_robot_visual_only = False
+    cfg.background_right_robot_visual_only = True
+    cfg.background_fr3v2_right_robot_visual_only = False
+    cfg.background_right_robot_copy_active_visual = False
+    cfg.robot.prim_path = "/World/envs/env_.*/franka_env/Robot/franka"
+    cfg.robot_base_rot = (0.0, 0.0, 0.0, 1.0)
+    cfg.task.fixed_asset.init_state.pos = tuple(cfg.pi0_hole_init_pos)
+    cfg.task.fixed_asset.init_state.rot = tuple(cfg.pi0_hole_init_rot)
+    cfg.robot.init_state.rot = tuple(cfg.pi0_robot_init_rot)
+
+    # Match the Pi0 contact/solver limits; this is not a new TAVLA dynamics
+    # path, only the same safe limits used by the validated Pi0 rollout.
+    for asset_cfg in (cfg.robot, cfg.task.fixed_asset, cfg.task.held_asset):
+        rigid_props = getattr(asset_cfg.spawn, "rigid_props", None)
+        if rigid_props is not None:
+            rigid_props.solver_position_iteration_count = 64
+            rigid_props.max_depenetration_velocity = 1.0
+    collision_props = getattr(cfg.robot.spawn, "collision_props", None)
+    if collision_props is not None:
+        collision_props.contact_offset = 0.001
+    articulation_props = getattr(cfg.robot.spawn, "articulation_props", None)
+    if articulation_props is not None:
+        articulation_props.solver_position_iteration_count = 64
 
 
 class TavlaResidualEnv(RealSimEnv):
     """Peg-insertion environment with a frozen TAVLA joint-target teacher."""
 
     def __init__(self, cfg, render_mode=None, **kwargs):
+        _configure_pi0_rollout_scene(cfg)
         self._tavla_ready = False
         self._teacher_control_mode = getattr(cfg, "teacher_control_mode", "aligned_joint")
         if self._teacher_control_mode not in {"kinematic_taskspace", "aligned_joint", "ppo_cartesian"}:
@@ -39,6 +105,10 @@ class TavlaResidualEnv(RealSimEnv):
             cfg.robot.actuators["panda_arm2"].stiffness = float(cfg.joint_target_kp[4])
             cfg.robot.actuators["panda_arm2"].damping = float(cfg.joint_target_kd[4])
         super().__init__(cfg, render_mode, **kwargs)
+        # Pi0's calibrated scene also rebinds the active Franka's light/gray
+        # materials to the real gray-white appearance.  TAVLA adds only the
+        # wrench input, so keep this visual contract identical.
+        self._override_pi0_active_robot_base_gray_to_white()
 
         if cfg.teacher_policy_cfg is None:
             raise ValueError("TavlaResidualEnv requires cfg.teacher_policy_cfg")
@@ -47,8 +117,12 @@ class TavlaResidualEnv(RealSimEnv):
                 "The initial remote TAVLA adapter supports one environment; "
                 "use num_envs=1 until the server supports batched inference."
             )
+        self._initialize_tavla_force_gate_contact_view()
 
-        policy_class = getattr(self, "teacher_policy_class", PI0RemotePolicyTAVLA)
+        policy_class = getattr(self, "teacher_policy_class", None)
+        if policy_class is None:
+            from .policy.modeling_pi0remote import PI0RemotePolicyTAVLA
+            policy_class = PI0RemotePolicyTAVLA
         self.teacher_policy = policy_class(cfg.teacher_policy_cfg)
         self.teacher_hold_steps = max(1, int(cfg.teacher_hold_steps))
         self.teacher_replan_actions = max(1, int(getattr(cfg, "teacher_replan_actions", 5)))
@@ -135,6 +209,37 @@ class TavlaResidualEnv(RealSimEnv):
         self._extend_observation_space(16)
         self._tavla_ready = True
 
+    def _set_pi0_hole_visual_color(self, color) -> None:
+        """Reuse Pi0's per-camera hole material switch for TAVLA frames."""
+        return Pi0RealSimEnv._set_pi0_hole_visual_color(self, color)
+
+    def _clean_wrist_camera_frame(self, frame):
+        """Apply the Pi0 wrist-edge cleanup to TAVLA's continuous video."""
+
+        if torch.is_tensor(frame):
+            image = frame.detach().cpu().numpy()
+        else:
+            image = np.asarray(frame)
+        cleaned = _sanitize_pi0_wrist_green_overlay(image, self.cfg)
+        return torch.from_numpy(cleaned)
+
+    def _refresh_model_input_video_frame(self):
+        """Refresh transformed TAVLA images without an extra RTX render."""
+
+        front_np, wrist_np = Pi0RealSimEnv._continuous_policy_video_observation(self)
+        self.last_model_input_front = torch.from_numpy(
+            np.ascontiguousarray(front_np)
+        ).clone()
+        self.last_model_input_wrist = torch.from_numpy(
+            np.ascontiguousarray(wrist_np)
+        ).clone()
+        self._model_visual_frame_ready = True
+        return True
+
+    def _override_pi0_active_robot_base_gray_to_white(self):
+        """Reuse Pi0's active-robot material bindings for TAVLA frames."""
+        return Pi0RealSimEnv._override_pi0_active_robot_base_gray_to_white(self)
+
     def _load_teacher_visual_calibration(self):
         if self._teacher_visual_profile == "raw":
             return {}
@@ -148,6 +253,118 @@ class TavlaResidualEnv(RealSimEnv):
         if not isinstance(calibration, dict):
             raise ValueError("TAVLA camera calibration must be a JSON object")
         return calibration
+
+    def _initialize_tavla_force_gate_contact_view(self):
+        """Create a direct PhysX peg-hole contact view for the force gate."""
+        self._tavla_force_gate_contact_view = None
+        if not bool(getattr(self.cfg, "tavla_force_gate_enabled", False)):
+            return
+
+        from pxr import Usd
+
+        def contact_report_paths(root_path: str) -> list[str]:
+            root = self.sim.stage.GetPrimAtPath(root_path)
+            return [
+                str(prim.GetPath())
+                for prim in Usd.PrimRange(root)
+                if "PhysxContactReportAPI" in prim.GetAppliedSchemas()
+            ]
+
+        held_paths = contact_report_paths("/World/envs/env_0/HeldAsset")
+        fixed_paths = contact_report_paths("/World/envs/env_0/FixedAsset")
+        if not held_paths or not fixed_paths:
+            raise RuntimeError(
+                "TAVLA force gate requires PhysX contact-report bodies for "
+                f"peg/hole; held={held_paths}, fixed={fixed_paths}"
+            )
+        physics_view = self.sim.physics_manager.get_physics_sim_view()
+        if physics_view is None:
+            raise RuntimeError("TAVLA force gate cannot access the PhysX simulation view")
+        self._tavla_force_gate_contact_view = physics_view.create_rigid_contact_view(
+            held_paths,
+            filter_patterns=[fixed_paths for _ in held_paths],
+            max_contact_data_count=256,
+        )
+        print(
+            "[TAVLA ForceGate] direct PhysX peg-hole contact view ready: "
+            f"held={held_paths}, fixed={fixed_paths}",
+            flush=True,
+        )
+
+    def _tavla_force_gate_contact_norm(self) -> torch.Tensor:
+        """Return the total normal-contact magnitude for each environment."""
+        if self._tavla_force_gate_contact_view is None:
+            return torch.zeros((self.num_envs,), dtype=torch.float32, device=self.device)
+        force_matrix = self._tavla_force_gate_contact_view.get_contact_force_matrix(
+            dt=float(self.physics_dt)
+        )
+        if hasattr(force_matrix, "torch"):
+            force_matrix = force_matrix.torch
+        force_matrix = torch.as_tensor(force_matrix, dtype=torch.float32, device=self.device)
+        if force_matrix.ndim == 2:
+            force_matrix = force_matrix.unsqueeze(0)
+        if force_matrix.ndim != 3 or force_matrix.shape[-1] != 3:
+            raise RuntimeError(
+                "Unexpected TAVLA contact-force shape: "
+                f"{tuple(force_matrix.shape)}"
+            )
+        # Sum magnitudes instead of the signed vector so opposing contact
+        # points cannot cancel and hide a real peg-hole contact.
+        return torch.linalg.vector_norm(force_matrix, dim=-1).sum(dim=-1)
+
+    def _update_tavla_force_gate(self):
+        """Update the latched contact gate once per recorded TAVLA frame."""
+        raw_wrench = self.wrench_final
+        if not bool(getattr(self.cfg, "tavla_force_gate_enabled", False)):
+            self._tavla_gated_wrench = raw_wrench.clone()
+            self.last_tavla_force_gate_active[:] = True
+            self.last_tavla_force_gate_contact_norm[:] = 0.0
+            return
+
+        contact_norm = self._tavla_force_gate_contact_norm()
+        self.last_tavla_force_gate_contact_norm[:] = contact_norm
+        threshold = float(getattr(self.cfg, "tavla_force_gate_threshold_n", 0.5))
+        confirm_steps = max(1, int(getattr(self.cfg, "tavla_force_gate_confirm_steps", 2)))
+        release_steps = max(0, int(getattr(self.cfg, "tavla_force_gate_release_steps", 3)))
+        contact_now = contact_norm >= threshold
+        self._tavla_force_gate_confirm_count = torch.where(
+            contact_now,
+            self._tavla_force_gate_confirm_count + 1,
+            torch.zeros_like(self._tavla_force_gate_confirm_count),
+        )
+        newly_confirmed = (
+            ~self.last_tavla_force_gate_active
+            & (self._tavla_force_gate_confirm_count >= confirm_steps)
+        )
+        if bool(torch.any(newly_confirmed)):
+            self.last_tavla_force_gate_active[newly_confirmed] = True
+            self._tavla_force_gate_blend_remaining[newly_confirmed] = release_steps
+            print(
+                "[TAVLA ForceGate] peg-hole contact confirmed; "
+                f"norm={float(contact_norm.max().detach().cpu()):.4f} N",
+                flush=True,
+            )
+
+        baseline = self._tavla_force_gate_baseline
+        gated = torch.where(
+            self.last_tavla_force_gate_active.unsqueeze(-1),
+            raw_wrench,
+            baseline,
+        )
+        blending = self._tavla_force_gate_blend_remaining > 0
+        if bool(torch.any(blending)):
+            alpha = 1.0 - (
+                self._tavla_force_gate_blend_remaining.float()
+                / max(float(release_steps), 1.0)
+            )
+            alpha = alpha.clamp(0.0, 1.0).unsqueeze(-1)
+            gated = torch.where(
+                blending.unsqueeze(-1),
+                baseline + alpha * (raw_wrench - baseline),
+                gated,
+            )
+            self._tavla_force_gate_blend_remaining[blending] -= 1
+        self._tavla_gated_wrench = gated
 
     def _activate_teacher_position_servo(self):
         if not self._teacher_execution_position_servo or self._teacher_position_servo_activated:
@@ -356,12 +573,21 @@ class TavlaResidualEnv(RealSimEnv):
     def _current_tavla_state(self):
         if self.joint_pos.shape[1] < 9:
             raise RuntimeError("TAVLA residual control requires 7 arm joints and 2 finger joints")
-        finger_pos = self.joint_pos[:, 7:9]
-        if finger_pos.shape[1] == 0:
-            gripper = torch.zeros((self.num_envs,), device=self.device)
-        else:
+        # TAVLA is fine-tuned from the same Pi0 trajectory contract.  The
+        # eighth state value is the recorded raw gripper position (~0.0865),
+        # not a normalized [0, 1] fraction of the finger joint width.
+        pi0_cfg = getattr(self.cfg, "pi0_policy_cfg", None)
+        gripper_override = getattr(pi0_cfg, "gripper_state_override", None)
+        if gripper_override is None:
+            finger_pos = self.joint_pos[:, 7:9]
             gripper = finger_pos.mean(dim=1) / self.gripper_open_width_m
-        gripper = torch.clamp(gripper, 0.0, 1.0).unsqueeze(-1)
+        else:
+            gripper = torch.full(
+                (self.num_envs,), float(gripper_override), dtype=torch.float32, device=self.device
+            )
+        gripper_min = float(getattr(pi0_cfg, "gripper_policy_min", 0.0))
+        gripper_max = float(getattr(pi0_cfg, "gripper_policy_max", 0.094847))
+        gripper = torch.clamp(gripper, gripper_min, gripper_max).unsqueeze(-1)
         return torch.cat((self.joint_pos[:, :7], gripper), dim=-1)
 
     def _initialize_teacher_runtime(self):
@@ -411,6 +637,27 @@ class TavlaResidualEnv(RealSimEnv):
         self.last_tavla_actual_state = torch.zeros((self.num_envs, 8), device=self.device)
         self.last_tavla_policy_state = torch.zeros((self.num_envs, 8), device=self.device)
         self.last_tavla_effort = torch.zeros((self.num_envs, 6), device=self.device)
+        self._tavla_effort_history = deque(maxlen=10000)
+        self._tavla_force_gate_baseline = torch.as_tensor(
+            getattr(self.cfg, "tavla_force_gate_precontact_wrench", [0.0] * 6),
+            dtype=torch.float32,
+            device=self.device,
+        ).view(1, 6).repeat(self.num_envs, 1)
+        if self._tavla_force_gate_baseline.shape != (self.num_envs, 6):
+            raise ValueError("tavla_force_gate_precontact_wrench must contain six values")
+        self._tavla_gated_wrench = self._tavla_force_gate_baseline.clone()
+        self.last_tavla_force_gate_active = torch.zeros(
+            (self.num_envs,), dtype=torch.bool, device=self.device
+        )
+        self.last_tavla_force_gate_contact_norm = torch.zeros(
+            (self.num_envs,), dtype=torch.float32, device=self.device
+        )
+        self._tavla_force_gate_confirm_count = torch.zeros(
+            (self.num_envs,), dtype=torch.long, device=self.device
+        )
+        self._tavla_force_gate_blend_remaining = torch.zeros(
+            (self.num_envs,), dtype=torch.long, device=self.device
+        )
         self.last_tavla_wrench_base = torch.zeros((self.num_envs, 6), device=self.device)
         self.last_tavla_wrench_final = torch.zeros((self.num_envs, 6), device=self.device)
         self.last_tavla_adapted_wrench = torch.zeros((self.num_envs, 6), device=self.device)
@@ -459,7 +706,30 @@ class TavlaResidualEnv(RealSimEnv):
         """Return the sign-corrected wrench sent to TAVLA."""
         # Server-side norm_stats handle normalization. Do not apply the RL
         # observation bias/scale or simulated noise to the TAVLA payload.
+        if bool(getattr(self.cfg, "tavla_force_gate_enabled", False)):
+            return self._tavla_gated_wrench
         return self.wrench_final
+
+    def _record_tavla_effort(self):
+        """Record one 10 Hz wrench frame for the TAVLA history input."""
+        self._update_tavla_force_gate()
+        current = self._teacher_wrench()[0].detach().cpu().numpy().astype(np.float32, copy=True)
+        if current.shape != (6,) or not np.isfinite(current).all():
+            raise FloatingPointError(f"TAVLA effort history frame must be finite (6,), got {current.shape}")
+        self._tavla_effort_history.append(current)
+
+    def _tavla_effort_history_payload(self, current):
+        """Return [t-36, t-32, ..., t] as an old-to-new (10, 6) array."""
+        current = np.asarray(current, dtype=np.float32).reshape(6)
+        if not self._tavla_effort_history or not np.array_equal(self._tavla_effort_history[-1], current):
+            self._tavla_effort_history.append(current.copy())
+        rows = []
+        for deque_index in range(-37, 0, 4):
+            if len(self._tavla_effort_history) + deque_index >= 0:
+                rows.append(self._tavla_effort_history[deque_index])
+            else:
+                rows.append(self._tavla_effort_history[0])
+        return np.ascontiguousarray(np.stack(rows, axis=0), dtype=np.float32)
 
     def _teacher_batch(self):
         if not hasattr(self, "tiled_camera") or self.tiled_camera is None:
@@ -469,20 +739,19 @@ class TavlaResidualEnv(RealSimEnv):
         if not hasattr(self, "wrench_base") or not hasattr(self, "wrench_final"):
             raise RuntimeError("TAVLA teacher requires base-frame and final wrench data")
 
-        # TAVLA infers before the first physics substep. Refresh RTX cameras
-        # here so the payload is the current reset/command frame, not the
-        # previous render cached by the sensor during reset.
-        self.sim.render()
-        self.tiled_camera.update(self.physics_dt, force_recompute=True)
-        self.wrist_tiled_camera.update(self.physics_dt, force_recompute=True)
-        front_raw = self.tiled_camera.data.output["rgb"][0].detach().cpu().unsqueeze(0)
-        wrist_raw = self.wrist_tiled_camera.data.output["rgb"][0].detach().cpu().unsqueeze(0)
-        self.last_tavla_front = front_raw[0].clone()
-        self.last_tavla_wrist = wrist_raw[0].clone()
-        front = self._apply_teacher_visual_profile(front_raw, "front")
-        wrist = self._apply_teacher_visual_profile(wrist_raw, "wrist")
+        # Reuse the exact Pi0 camera/background/material pipeline. TAVLA adds
+        # only the wrench field to this payload; it must not receive the old
+        # generic RealSim raw camera view.
+        front_np, wrist_np = Pi0RealSimEnv._camera_observation(self)
+        front = torch.from_numpy(np.ascontiguousarray(front_np)).unsqueeze(0)
+        wrist = torch.from_numpy(np.ascontiguousarray(wrist_np)).unsqueeze(0)
+        self.last_tavla_front = front[0].clone()
+        self.last_tavla_wrist = wrist[0].clone()
         self.last_tavla_transformed_front = front[0].clone()
         self.last_tavla_transformed_wrist = wrist[0].clone()
+        self.last_model_input_front = front[0].clone()
+        self.last_model_input_wrist = wrist[0].clone()
+        self._model_visual_frame_ready = True
         self._tavla_visual_frame_ready = True
         actual_state = self._current_tavla_state()
         if self._teacher_control_mode == "kinematic_taskspace":
@@ -507,19 +776,21 @@ class TavlaResidualEnv(RealSimEnv):
             raise FloatingPointError("TAVLA wrench_base/wrench_final contains NaN or Inf")
         expected_final = -self.wrench_base
         matches_neg_base = torch.equal(effort, expected_final)
-        if not matches_neg_base:
+        gate_enabled = bool(getattr(self.cfg, "tavla_force_gate_enabled", False))
+        if not gate_enabled and not matches_neg_base:
             raise RuntimeError("wrench_final must equal -wrench_base before TAVLA inference")
         self.last_tavla_effort = effort.detach().clone()
         self.last_tavla_wrench_base = self.wrench_base.detach().clone()
         self.last_tavla_wrench_final = effort.detach().clone()
         self.last_tavla_adapted_wrench = effort.detach().clone()
         self.last_tavla_wrench_matches_neg_base[:] = matches_neg_base
-        effort = effort[0].detach().cpu().unsqueeze(0)
+        current_effort = effort[0].detach().cpu().numpy().astype(np.float32, copy=False)
+        effort_history = self._tavla_effort_history_payload(current_effort)
         return {
             "observation.images.front": front,
             "observation.images.left_wrist": wrist,
             "observation.state": state,
-            "observation.effort": effort,
+            "observation.effort": torch.from_numpy(effort_history).unsqueeze(0),
             "task": getattr(self.cfg, "teacher_prompt", "peg-in-hole"),
         }
 
@@ -534,12 +805,15 @@ class TavlaResidualEnv(RealSimEnv):
             payload_effort = getattr(self.teacher_policy, "last_server_payload_effort", None)
             if payload_effort is None:
                 raise RuntimeError("TAVLA client did not record the effort payload sent to Server")
-            payload_effort = np.asarray(payload_effort, dtype=np.float32).reshape(-1)
+            payload_effort = np.asarray(payload_effort, dtype=np.float32)
+            if payload_effort.shape != (10, 6):
+                raise ValueError(f"TAVLA server effort must be (10, 6), got {payload_effort.shape}")
+            payload_current = payload_effort[-1]
             expected_effort = self.last_tavla_effort[0].detach().cpu().numpy().astype(
                 np.float32, copy=False
             )
             payload_finite = bool(np.isfinite(payload_effort).all())
-            payload_matches_final = bool(np.array_equal(payload_effort, expected_effort))
+            payload_matches_final = bool(np.array_equal(payload_current, expected_effort))
             if not payload_finite:
                 raise FloatingPointError("Server effort payload contains NaN or Inf")
             if not payload_matches_final:
@@ -550,7 +824,7 @@ class TavlaResidualEnv(RealSimEnv):
             if not payload_matches_sent:
                 raise RuntimeError("WebSocket effort bytes were not verified against the TAVLA payload")
             self.last_tavla_server_effort[0] = torch.as_tensor(
-                payload_effort, dtype=torch.float32, device=self.device
+                payload_current, dtype=torch.float32, device=self.device
             )
             self.last_tavla_server_effort_is_finite[:] = payload_finite
             self.last_tavla_server_effort_matches_final[:] = payload_matches_final
@@ -567,10 +841,15 @@ class TavlaResidualEnv(RealSimEnv):
             if not torch.isfinite(chunk).all():
                 self.last_teacher_action_nonfinite = True
                 raise ValueError("TAVLA chunk contains non-finite values")
-            # The checkpoint uses normalized gripper semantics:
-            # 0=closed and 1=open. Keep the teacher target in that domain
-            # before converting it to the simulated finger joint position.
-            chunk[:, 7] = torch.clamp(chunk[:, 7], 0.0, 1.0)
+            # Keep Pi0's raw gripper-position semantics. The real training
+            # trajectories contain approximately 0.0865 here; the simulated
+            # finger target is converted to metres only in _apply_action().
+            pi0_cfg = getattr(self.cfg, "pi0_policy_cfg", None)
+            chunk[:, 7] = torch.clamp(
+                chunk[:, 7],
+                float(getattr(pi0_cfg, "gripper_policy_min", 0.0)),
+                float(getattr(pi0_cfg, "gripper_policy_max", 0.094847)),
+            )
 
             self._teacher_chunk = chunk.to(self.device)
             start_index = max(1, int(getattr(self.cfg, "teacher_action_start_index", 1)))
@@ -799,7 +1078,12 @@ class TavlaResidualEnv(RealSimEnv):
             delta_q_xy = torch.where(active.unsqueeze(-1), delta_q_xy, torch.zeros_like(delta_q_xy))
             target[:, :7] += self._privileged_xy_guidance_weight * delta_q_xy
         target[:, 7] += self._gripper_residual_scale * self.residual_action[:, 7]
-        target[:, 7] = torch.clamp(target[:, 7], 0.0, 1.0)
+        pi0_cfg = getattr(self.cfg, "pi0_policy_cfg", None)
+        target[:, 7] = torch.clamp(
+            target[:, 7],
+            float(getattr(pi0_cfg, "gripper_policy_min", 0.0)),
+            float(getattr(pi0_cfg, "gripper_policy_max", 0.094847)),
+        )
         lower, upper = self._joint_limits()
         target[:, :7] = torch.minimum(torch.maximum(target[:, :7], lower), upper)
         if self._teacher_control_mode == "kinematic_taskspace":
@@ -846,6 +1130,7 @@ class TavlaResidualEnv(RealSimEnv):
                 self.sim.forward()
                 self.scene.update(dt=0.0)
                 self._compute_intermediate_values(dt=self.physics_dt)
+            self._record_tavla_effort()
             self._advance_teacher_target()
         self._combine_teacher_and_residual()
 
@@ -993,6 +1278,14 @@ class TavlaResidualEnv(RealSimEnv):
 
     def _reset_idx(self, env_ids):
         super()._reset_idx(env_ids)
+        if hasattr(self, "_tavla_effort_history"):
+            self._tavla_effort_history.clear()
+        if hasattr(self, "_tavla_force_gate_baseline"):
+            self._tavla_gated_wrench[env_ids] = self._tavla_force_gate_baseline[env_ids]
+            self.last_tavla_force_gate_active[env_ids] = False
+            self.last_tavla_force_gate_contact_norm[env_ids] = 0.0
+            self._tavla_force_gate_confirm_count[env_ids] = 0
+            self._tavla_force_gate_blend_remaining[env_ids] = 0
         # DirectRLEnv may reset while the RealSim base class is still being
         # constructed. The teacher queue is initialized immediately after
         # that construction completes.

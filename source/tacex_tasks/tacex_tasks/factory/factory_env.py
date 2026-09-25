@@ -7,7 +7,7 @@ import numpy as np
 import torch
 
 import carb
-import isaacsim.core.utils.torch as torch_utils
+import tacex_tasks.torch_compat as torch_utils
 
 import isaaclab.sim as sim_utils
 from isaaclab.assets import Articulation
@@ -26,8 +26,6 @@ import isaaclab.utils.math as math_utils
 
 from isaaclab_tasks.direct.factory import factory_control,factory_utils
 from .factory_env_cfg import OBS_DIM_CFG, STATE_DIM_CFG, FactoryEnvCfg
-from .policy.modeling_pi0remote import PI0RemotePolicy,PI0RemotePolicyTAVLA
-from .policy.configuration_pi0remote import PI0RemoteConfig,PI0RemoteTAVLAConfig
 
 
 
@@ -46,6 +44,7 @@ class FactoryEnv(DirectRLEnv):
 
 
         if cfg.policy_cfg:
+            from .policy.modeling_pi0remote import PI0RemotePolicy
             # self.policy = PI0RemotePolicyTAVLA(cfg.policy_cfg)  # 如果是带力触觉的 TA-VLA 模型
             self.policy = PI0RemotePolicy(cfg.policy_cfg) 
         else:

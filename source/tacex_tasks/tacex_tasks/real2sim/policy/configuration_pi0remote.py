@@ -32,7 +32,11 @@ class PI0RemoteConfig():
     host_port: int = 8990
     n_action_steps: int = 10
     connection_timeout_s: float = 15.0
-    inference_timeout_s: float = 30.0
+    # The client must never wait forever for a chunk response. Typical Pi0
+    # inference is below one second; ten seconds leaves ample margin while
+    # still allowing the rollout to recover from a stalled request.
+    inference_timeout_s: float = 10.0
+    inference_retry_backoff_s: float = 1.0
     temporal_ensemble_coeff: float | None = None # If not None, use temporPal ensembling with this coefficient
     # temporal_ensemble_coeff: float = 0.01
     # Add any other specific configuration parameters for pi0_remote here
@@ -68,10 +72,10 @@ class PI0RemoteConfig():
 class PI0RemoteTAVLAConfig(PI0RemoteConfig):
     type: str = "pi0remote_tavla"
     
-    # These defaults match the currently running fine-tuned TAVLA server.
-    # Keep the generic PI0RemoteConfig defaults unchanged for other policies.
-    host_ip: str = "10.0.40.113"
-    host_port: int = 8000
+    # Default to the pure-real six-dimensional-force TAVLA checkpoint. The
+    # co-training checkpoint is selected explicitly with host_port=8002.
+    host_ip: str = "114.214.164.36"
+    host_port: int = 8001
     n_action_steps: int = 50
 
     # The checkpoint was fine-tuned with a single current effort frame. The

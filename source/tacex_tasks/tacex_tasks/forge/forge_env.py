@@ -14,7 +14,7 @@ import time
 from .isaac_forge_env import ForgeEnv as IsaacForgeEnv
 from .forge_env_cfg import ForgeEnvCfg
 from isaaclab.sensors import TiledCamera
-import isaacsim.core.utils.torch as torch_utils
+import tacex_tasks.torch_compat as torch_utils
 from isaaclab_tasks.direct.factory import factory_utils
 import isaaclab.sim as sim_utils
 import carb

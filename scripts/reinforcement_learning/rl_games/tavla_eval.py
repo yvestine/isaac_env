@@ -5,19 +5,30 @@ import argparse
 import csv
 import json
 import shutil
+import time
 from pathlib import Path
 from PIL import Image
 
 import numpy as np
 import torch
+from tqdm import tqdm
 from isaaclab.app import AppLauncher
 
 parser = argparse.ArgumentParser(description="TAVLA teacher-only RealSim evaluation")
 parser.add_argument("--task", type=str, default="TacEx-RealSim-PegInsert-TAVLA-Teacher-v0")
-parser.add_argument("--tavla-host", type=str, default="10.0.40.113")
-parser.add_argument("--tavla-port", type=int, default=8000)
+parser.add_argument("--tavla-host", type=str, default="114.214.164.36")
+parser.add_argument("--tavla-port", type=int, default=8001, choices=(8001, 8002))
 parser.add_argument("--steps", type=int, default=600)
+parser.add_argument(
+    "--episode-length-s",
+    type=float,
+    default=None,
+    help="Override the episode duration; converted to RealSim environment steps.",
+)
 parser.add_argument("--episodes", type=int, default=1)
+parser.add_argument("--reset-schedule", type=Path, default=None)
+parser.add_argument("--action-start-index", type=int, default=1)
+parser.add_argument("--replan-actions", type=int, default=5)
 parser.add_argument("--teacher-hold-steps", type=int, default=None)
 parser.add_argument("--disable-teacher-state-alignment", action="store_true")
 parser.add_argument("--use-corrected-wrench", action="store_true", help="Use wrench_corrected; requires ft_corrected_ready=True")
@@ -78,6 +89,70 @@ def _vector(value):
     if torch.is_tensor(value):
         value = value.detach().cpu().numpy()
     return np.asarray(value, dtype=np.float64).reshape(-1)
+
+
+def _load_reset_schedule(path, episodes):
+    if path is None:
+        return None
+    path = path.expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"Reset schedule CSV not found: {path}")
+    required = (
+        "hole_dx_m", "hole_dy_m", "hole_dz_m",
+        "hand_dx_m", "hand_dy_m", "hand_dz_m",
+    )
+    with path.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    if len(rows) < episodes:
+        raise ValueError(f"Reset schedule has {len(rows)} rows, need {episodes}")
+    if any(name not in rows[0] for name in required):
+        raise ValueError(f"Reset schedule is missing one of {required}")
+    schedule = []
+    for row_index, row in enumerate(rows[:episodes]):
+        try:
+            schedule.append(
+                {
+                    "hole_offset_m": [float(row[name]) for name in required[:3]],
+                    "hand_offset_m": [float(row[name]) for name in required[3:]],
+                }
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid reset schedule row {row_index + 2}") from exc
+    return schedule
+
+
+def _pose_metrics(env):
+    row = _privileged_state(env)
+    return {"xy_error_m": float(row[6]), "z_disp_m": float(row[7])}
+
+
+def _reset_snapshot(env):
+    metrics = _pose_metrics(env)
+    return {
+        "hole_offset_m": _vector(
+            getattr(env, "tavla_last_hole_position_offset_m", np.zeros((1, 3)))
+        )[:3].tolist(),
+        "hand_offset_m": _vector(
+            getattr(env, "tavla_last_hand_position_offset_m", np.zeros((1, 3)))
+        )[:3].tolist(),
+        "hole_position_m": _vector(env.fixed_pos)[:3].tolist(),
+        "fingertip_position_m": _vector(env.fingertip_midpoint_pos)[:3].tolist(),
+        "initial_xy_error_m": metrics["xy_error_m"],
+        "initial_z_disp_m": metrics["z_disp_m"],
+    }
+
+
+def _write_episode_rows(path, rows):
+    fields = [
+        "episode", "episode_dir", "success", "steps", "return", "timed_out",
+        "hole_dx_m", "hole_dy_m", "hole_dz_m",
+        "hand_dx_m", "hand_dy_m", "hand_dz_m",
+        "initial_xy_error_m", "initial_z_disp_m", "best_xy_error_m", "minimum_z_disp_m",
+    ]
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 def _privileged_state(env):
@@ -169,10 +244,17 @@ def main():
         raise ValueError("--steps must be positive")
     if args.episodes <= 0:
         raise ValueError("--episodes must be positive")
+    if args.episode_length_s is not None and args.episode_length_s <= 0.0:
+        raise ValueError("--episode-length-s must be positive")
+    if args.action_start_index < 1:
+        raise ValueError("--action-start-index must be at least 1")
+    if args.replan_actions <= 0:
+        raise ValueError("--replan-actions must be positive")
 
     output_dir = args.output_dir.resolve()
     if not args.summary_only:
         _prepare_output_dir(output_dir, args.minimal_output)
+    reset_schedule = _load_reset_schedule(args.reset_schedule, args.episodes)
 
     env_cfg = parse_env_cfg(
         args.task,
@@ -190,9 +272,24 @@ def main():
     env_cfg.teacher_control_mode = "aligned_joint"
     env_cfg.teacher_state_alignment = False
     env_cfg.teacher_action_state_alignment = False
-    env_cfg.teacher_action_start_index = 1
-    env_cfg.teacher_replan_actions = 5
+    env_cfg.teacher_action_start_index = args.action_start_index
+    env_cfg.teacher_replan_actions = args.replan_actions
     env_cfg.teacher_action_interpolation = True
+    step_dt = float(env_cfg.sim.dt) * int(env_cfg.decimation)
+    if args.episode_length_s is not None:
+        env_cfg.episode_length_s = float(args.episode_length_s)
+        max_steps = max(1, int(round(args.episode_length_s / step_dt)))
+    else:
+        max_steps = args.steps
+        # Keep the explicit --steps contract deterministic even when the task
+        # config has a different default timeout.
+        env_cfg.episode_length_s = max_steps * step_dt
+    if reset_schedule is not None:
+        # Pi0's fixed schedule has deterministic hole/hand positions.  Disable
+        # the separate RealSim yaw/IK noise so the two evaluators compare the
+        # same initial pose rather than different random orientations.
+        env_cfg.task.fixed_asset_init_orn_range_deg = 0.0
+        env_cfg.task.hand_init_orn_noise = [0.0, 0.0, 0.0]
     # The trained PPO/Factory task used a 0.04 ratio, which is appropriate for
     # strict training termination but is too strict for this deployment check:
     # the 25 mm hole then requires less than 1 mm residual depth.  Use the
@@ -267,6 +364,7 @@ def main():
         env_cfg.teacher_hold_steps = args.teacher_hold_steps
 
     env = None
+    progress = None
     reward_rows = []
     reward_term_rows = []
     reward_term_names = set()
@@ -275,6 +373,7 @@ def main():
     observation_rows = []
     wrench_validation_rows = []
     privileged_rows = []
+    episode_rows = []
     last_valid_server_payload = None
     last_valid_sent_payload = None
     episodes = 0
@@ -284,8 +383,29 @@ def main():
 
     try:
         env = gym.make(args.task, cfg=env_cfg, output_dir=str(output_dir))
+        raw_env = env.unwrapped
+        if reset_schedule is not None:
+            raw_env.tavla_reset_schedule = reset_schedule
+            raw_env.tavla_reset_schedule_index = 0
         env.reset()
-        for step in range(args.steps * args.episodes):
+        raw_env = env.unwrapped
+        previous_successes = int(getattr(raw_env, "success_times", 0))
+        previous_total = int(getattr(raw_env, "total_times", 0))
+        reset_info = _reset_snapshot(raw_env)
+        episode_steps = 0
+        episode_return = 0.0
+        best_xy_error = float(reset_info["initial_xy_error_m"])
+        minimum_z_disp = float(reset_info["initial_z_disp_m"])
+        progress = tqdm(
+            total=max_steps * args.episodes,
+            desc=f"TAVLA rollout ({args.tavla_port})",
+            unit="step",
+            dynamic_ncols=True,
+        )
+        for step in range(max_steps * args.episodes):
+            before_step = _pose_metrics(raw_env)
+            best_xy_error = min(best_xy_error, before_step["xy_error_m"])
+            minimum_z_disp = min(minimum_z_disp, before_step["z_disp_m"])
             action = torch.zeros(
                 (1, env.unwrapped.cfg.action_space),
                 device=env.unwrapped.device,
@@ -301,7 +421,17 @@ def main():
                     Image.fromarray(image_array).save(output_dir / image_name)
                 initial_images_saved = True
             steps_run = step + 1
-            reward_rows.append([step, _scalar(reward)])
+            reward_value = _scalar(reward)
+            reward_rows.append([step, reward_value])
+            episode_steps += 1
+            episode_return += reward_value
+            progress.update(1)
+            progress.set_postfix(
+                episode=f"{episodes + 1}/{args.episodes}",
+                infer=int(getattr(raw_env, "teacher_inference_count", 0)),
+                latency=f"{float(getattr(raw_env, 'teacher_inference_latency_s', 0.0)):.3f}s",
+                failures=int(getattr(raw_env, "teacher_failures", 0)),
+            )
 
             extras = getattr(env.unwrapped, "extras", {})
             reward_terms = {}
@@ -380,11 +510,60 @@ def main():
             privileged_rows.append([step, *_privileged_state(env.unwrapped)])
             episode_done = bool(_scalar(terminated)) or bool(_scalar(truncated))
             if episode_done:
+                current_successes = int(getattr(raw_env, "success_times", 0))
+                current_total = int(getattr(raw_env, "total_times", 0))
+                if current_total != previous_total + 1:
+                    raise RuntimeError(
+                        f"Expected one completed episode, total changed {previous_total} -> {current_total}"
+                    )
+                success = int(current_successes == previous_successes + 1)
+                if current_successes not in (previous_successes, previous_successes + 1):
+                    raise RuntimeError(
+                        f"Unexpected success counter change {previous_successes} -> {current_successes}"
+                    )
+                hole_offset = reset_info["hole_offset_m"]
+                hand_offset = reset_info["hand_offset_m"]
+                episode_rows.append(
+                    {
+                        "episode": episodes + 1,
+                        "episode_dir": f"episode_{episodes}",
+                        "success": success,
+                        "steps": episode_steps,
+                        "return": episode_return,
+                        "timed_out": int(bool(_scalar(truncated))),
+                        "hole_dx_m": hole_offset[0],
+                        "hole_dy_m": hole_offset[1],
+                        "hole_dz_m": hole_offset[2],
+                        "hand_dx_m": hand_offset[0],
+                        "hand_dy_m": hand_offset[1],
+                        "hand_dz_m": hand_offset[2],
+                        "initial_xy_error_m": reset_info["initial_xy_error_m"],
+                        "initial_z_disp_m": reset_info["initial_z_disp_m"],
+                        "best_xy_error_m": best_xy_error,
+                        "minimum_z_disp_m": minimum_z_disp,
+                    }
+                )
                 episodes += 1
+                if not args.summary_only:
+                    _write_episode_rows(output_dir / "episodes.csv", episode_rows)
+                print(
+                    f"[TAVLA] episode={episodes}/{args.episodes} success={bool(success)} "
+                    f"steps={episode_steps} cumulative={current_successes}/{current_total}",
+                    flush=True,
+                )
+                previous_successes = current_successes
+                previous_total = current_total
                 last_valid_server_payload = None
                 last_valid_sent_payload = None
                 if episodes >= args.episodes:
                     break
+                reset_info = _reset_snapshot(raw_env)
+                episode_steps = 0
+                episode_return = 0.0
+                best_xy_error = float(reset_info["initial_xy_error_m"])
+                minimum_z_disp = float(reset_info["initial_z_disp_m"])
+        if progress is not None:
+            progress.close()
         if args.summary_only:
             total_episodes = int(getattr(env.unwrapped, "total_times", 0))
             successes = int(getattr(env.unwrapped, "success_times", 0))
@@ -541,10 +720,21 @@ def main():
             "task": args.task,
             "steps": steps_run,
             "episodes": episodes,
+            "episode_steps_limit": max_steps,
             "diagnostic_only": bool(args.diagnostic_only),
             "tavla_host": args.tavla_host,
             "minimal_output": bool(args.minimal_output),
             "tavla_port": args.tavla_port,
+            "model": "tavla_real_wrench" if args.tavla_port == 8001 else "tavla_cotrain_wrench",
+            "reset_schedule": (
+                str(args.reset_schedule.expanduser().resolve())
+                if args.reset_schedule is not None
+                else None
+            ),
+            "action_start_index": int(args.action_start_index),
+            "replan_actions": int(args.replan_actions),
+            "seed": None if args.seed is None else int(args.seed),
+            "episode_successes": int(sum(int(row["success"]) for row in episode_rows)),
             "teacher_hold_steps": int(cfg.teacher_hold_steps),
             "wrench_input": "adapted_wrench",
             "wrench_final_definition": "wrench_final = -wrench_base",
@@ -589,6 +779,8 @@ def main():
         )
         print(json.dumps(report, indent=2, ensure_ascii=False))
     finally:
+        if progress is not None:
+            progress.close()
         if args.summary_only and env is not None and not summary_printed:
             total_episodes = int(getattr(env.unwrapped, "total_times", 0))
             successes = int(getattr(env.unwrapped, "success_times", 0))

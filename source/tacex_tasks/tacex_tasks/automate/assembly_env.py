@@ -11,7 +11,7 @@ import torch
 import warp as wp
 
 import carb
-import isaacsim.core.utils.torch as torch_utils
+import tacex_tasks.torch_compat as torch_utils
 
 import isaaclab.sim as sim_utils
 from isaaclab.assets import Articulation, RigidObject

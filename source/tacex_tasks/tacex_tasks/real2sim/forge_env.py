@@ -5,7 +5,7 @@
 import numpy as np
 import torch
 
-import isaacsim.core.utils.torch as torch_utils
+import tacex_tasks.torch_compat as torch_utils
 
 from isaaclab.utils.math import axis_angle_from_quat
 
@@ -59,6 +59,7 @@ class ForgeEnv(FactoryEnv):
             )
         self.force_sensor_parent = torch.zeros((self.num_envs, 6), device=self.device)
         self.wrench_raw = torch.zeros((self.num_envs, 6), device=self.device)
+        self.wrench_child_joint_parent = torch.zeros((self.num_envs, 6), device=self.device)
         self.wrench_source = "uninitialized"
         self.wrench_anchor = torch.zeros((self.num_envs, 6), device=self.device)
         self.wrench_base = torch.zeros((self.num_envs, 6), device=self.device)
@@ -94,6 +95,12 @@ class ForgeEnv(FactoryEnv):
         self.ft_corrected_torque_offset_base_m = torch.as_tensor(
             self.cfg.ft_corrected_torque_offset_base_m, dtype=torch.float32, device=self.device
         ).reshape(1, 3)
+        self.ft_child_joint_to_parent_rotation = torch.as_tensor(
+            self.cfg.ft_child_joint_to_parent_rotation,
+            dtype=torch.float32,
+            device=self.device,
+        ).reshape(3, 3)
+        self.ft_child_joint_raw_sign = float(self.cfg.ft_child_joint_raw_sign)
 
         # Backward-compatible names used by existing collection code.
         self.force_sensor_smooth = torch.zeros((self.num_envs, 6), device=self.device)
@@ -116,20 +123,42 @@ class ForgeEnv(FactoryEnv):
         self.pos_threshold = self.default_pos_threshold.clone()
         self.rot_threshold = self.default_rot_threshold.clone()
 
+    def _as_torch(self, value):
+        """Convert Isaac Lab 3 ProxyArray/NumPy values to Torch tensors."""
+        value = value.torch if hasattr(value, "torch") and not isinstance(value, torch.Tensor) else value
+        return torch.as_tensor(value, dtype=torch.float32, device=self.device)
+
     def _raw_wrench_geometry(self):
         """Return raw wrench frame and candidate torque reference poses."""
-        parent_pos_w = self._robot.data.body_pos_w[:, self.force_sensor_parent_body_idx]
-        parent_quat_w = self._robot.data.body_quat_w[:, self.force_sensor_parent_body_idx]
-        anchor_pos_w = self._robot.data.body_pos_w[:, self.force_sensor_body_idx]
-        anchor_quat_w = self._robot.data.body_quat_w[:, self.force_sensor_body_idx]
-        raw_quat_w = parent_quat_w if self.cfg.ft_raw_wrench_frame == "parent_body" else anchor_quat_w
+        parent_pos_w = self._as_torch(self._robot.data.body_pos_w[:, self.force_sensor_parent_body_idx])
+        parent_quat_w = self._as_torch(self._robot.data.body_quat_w[:, self.force_sensor_parent_body_idx])
+        anchor_pos_w = self._as_torch(self._robot.data.body_pos_w[:, self.force_sensor_body_idx])
+        anchor_quat_w = self._as_torch(self._robot.data.body_quat_w[:, self.force_sensor_body_idx])
+        raw_quat_w = (
+            parent_quat_w
+            if self.cfg.ft_apply_child_joint_frame_calibration
+            or self.cfg.ft_raw_wrench_frame == "parent_body"
+            else anchor_quat_w
+        )
         if self.cfg.ft_raw_torque_reference == "parent_origin":
             raw_reference_pos_w = parent_pos_w
         elif self.cfg.ft_raw_torque_reference == "joint_anchor":
             raw_reference_pos_w = anchor_pos_w
         else:
-            raw_reference_pos_w = self._robot.data.body_pos_w[:, self.force_sensor_body_idx]
+            raw_reference_pos_w = self._as_torch(self._robot.data.body_pos_w[:, self.force_sensor_body_idx])
         return parent_pos_w, anchor_pos_w, anchor_quat_w, raw_quat_w, raw_reference_pos_w
+
+    def _wrench_raw_to_parent(self, wrench_raw):
+        """Rotate PhysX child-joint-frame wrench into its parent body frame."""
+        if not self.cfg.ft_apply_child_joint_frame_calibration:
+            return wrench_raw
+        force_parent = self.ft_child_joint_raw_sign * torch.einsum(
+            "ni,ij->nj", wrench_raw[:, :3], self.ft_child_joint_to_parent_rotation
+        )
+        torque_parent = self.ft_child_joint_raw_sign * torch.einsum(
+            "ni,ij->nj", wrench_raw[:, 3:6], self.ft_child_joint_to_parent_rotation
+        )
+        return torch.cat((force_parent, torque_parent), dim=-1)
 
     def _transform_raw_wrench_to_base(self, wrench_raw):
         """Express the incoming wrench as ``O_F_ext_hat_K``.
@@ -143,10 +172,11 @@ class ForgeEnv(FactoryEnv):
         _parent_pos_w, _anchor_pos_w, _anchor_quat_w, raw_quat_w, raw_reference_pos_w = (
             self._raw_wrench_geometry()
         )
-        k_pos_w = self._robot.data.body_pos_w[:, self.fingertip_body_idx]
-        root_quat_w = self._robot.data.root_quat_w
-        force_w = torch_utils.quat_apply(raw_quat_w, wrench_raw[:, :3])
-        torque_w_at_raw_reference = torch_utils.quat_apply(raw_quat_w, wrench_raw[:, 3:6])
+        wrench_frame = self._wrench_raw_to_parent(wrench_raw)
+        k_pos_w = self._as_torch(self._robot.data.body_pos_w[:, self.fingertip_body_idx])
+        root_quat_w = self._as_torch(self._robot.data.root_quat_w)
+        force_w = torch_utils.quat_apply(raw_quat_w, wrench_frame[:, :3])
+        torque_w_at_raw_reference = torch_utils.quat_apply(raw_quat_w, wrench_frame[:, 3:6])
         torque_w_at_k = torque_w_at_raw_reference + torch.cross(
             raw_reference_pos_w - k_pos_w, force_w, dim=-1
         )
@@ -160,8 +190,9 @@ class ForgeEnv(FactoryEnv):
         _parent_pos_w, anchor_pos_w, anchor_quat_w, raw_quat_w, raw_reference_pos_w = (
             self._raw_wrench_geometry()
         )
-        force_w = torch_utils.quat_apply(raw_quat_w, wrench_raw[:, :3])
-        torque_w_at_raw_reference = torch_utils.quat_apply(raw_quat_w, wrench_raw[:, 3:6])
+        wrench_frame = self._wrench_raw_to_parent(wrench_raw)
+        force_w = torch_utils.quat_apply(raw_quat_w, wrench_frame[:, :3])
+        torque_w_at_raw_reference = torch_utils.quat_apply(raw_quat_w, wrench_frame[:, 3:6])
         torque_w_at_anchor = torque_w_at_raw_reference + torch.cross(
             raw_reference_pos_w - anchor_pos_w, force_w, dim=-1
         )
@@ -184,11 +215,12 @@ class ForgeEnv(FactoryEnv):
             if reference == "panda_link7_origin":
                 target_pos_w = parent_pos_w
             else:
-                target_pos_w = self._robot.data.body_pos_w[:, self.fingertip_body_idx]
-            root_pos_w = self._robot.data.root_pos_w
-            root_quat_w = self._robot.data.root_quat_w
-            force_w = torch_utils.quat_apply(raw_quat_w, wrench_raw[:, :3])
-            torque_w_at_raw_reference = torch_utils.quat_apply(raw_quat_w, wrench_raw[:, 3:6])
+                target_pos_w = self._as_torch(self._robot.data.body_pos_w[:, self.fingertip_body_idx])
+            root_pos_w = self._as_torch(self._robot.data.root_pos_w)
+            root_quat_w = self._as_torch(self._robot.data.root_quat_w)
+            wrench_frame = self._wrench_raw_to_parent(wrench_raw)
+            force_w = torch_utils.quat_apply(raw_quat_w, wrench_frame[:, :3])
+            torque_w_at_raw_reference = torch_utils.quat_apply(raw_quat_w, wrench_frame[:, 3:6])
             torque_w_at_target = torque_w_at_raw_reference + torch.cross(
                 raw_reference_pos_w - target_pos_w, force_w, dim=-1
             )
@@ -207,10 +239,10 @@ class ForgeEnv(FactoryEnv):
 
     def _transform_parent_wrench_to_tool(self, wrench_parent):
         """Express a parent-frame joint wrench at the fingertip stiffness frame."""
-        parent_pos_w = self._robot.data.body_pos_w[:, self.force_sensor_parent_body_idx]
-        parent_quat_w = self._robot.data.body_quat_w[:, self.force_sensor_parent_body_idx]
-        tool_pos_w = self._robot.data.body_pos_w[:, self.fingertip_body_idx]
-        tool_quat_w = self._robot.data.body_quat_w[:, self.fingertip_body_idx]
+        parent_pos_w = self._as_torch(self._robot.data.body_pos_w[:, self.force_sensor_parent_body_idx])
+        parent_quat_w = self._as_torch(self._robot.data.body_quat_w[:, self.force_sensor_parent_body_idx])
+        tool_pos_w = self._as_torch(self._robot.data.body_pos_w[:, self.fingertip_body_idx])
+        tool_quat_w = self._as_torch(self._robot.data.body_quat_w[:, self.fingertip_body_idx])
 
         force_w = torch_utils.quat_apply(parent_quat_w, wrench_parent[:, :3])
         torque_w_at_parent = torch_utils.quat_apply(parent_quat_w, wrench_parent[:, 3:6])
@@ -240,15 +272,27 @@ class ForgeEnv(FactoryEnv):
 
     def _update_wrench(self):
         """Build the real-data-compatible 6D wrench used by RL and TA-VLA."""
-        self.wrench_raw = self._read_force_sensor_incoming_joint_wrench()
-        # Backward-compatible alias; frame/reference are still calibration hypotheses.
-        self.force_sensor_parent = self.wrench_raw
+        # Isaac Sim 6 may return a NumPy array from the incoming-wrench view;
+        # the Isaac Sim torch quaternion helpers require a torch Tensor.
+        self.wrench_raw = torch.as_tensor(
+            self._read_force_sensor_incoming_joint_wrench(),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        self.wrench_child_joint_parent = self._wrench_raw_to_parent(self.wrench_raw)
+        # Backward-compatible alias, now with explicit parent-frame semantics.
+        self.force_sensor_parent = self.wrench_child_joint_parent
         self.wrench_anchor = self._transform_raw_wrench_to_anchor(self.wrench_raw)
         self.wrench_base = self._transform_raw_wrench_to_base(self.wrench_raw)
         self.wrench_corrected = self._transform_raw_wrench_to_corrected(self.wrench_raw)
-        # PhysX incoming wrench has the opposite sign from the Franka
-        # O_F_ext_hat_K convention confirmed by the +/-X diagnostic.
-        self.wrench_final = -self.wrench_base
+        # Directed +/-XYZ loads identify both the child-joint rotation and its
+        # global sign. Legacy scenes retain their old final sign until this
+        # calibration is explicitly enabled.
+        self.wrench_final = (
+            self.wrench_base
+            if self.cfg.ft_apply_child_joint_frame_calibration
+            else -self.wrench_base
+        )
         if not torch.isfinite(self.wrench_final).all():
             raise FloatingPointError("wrench_final contains NaN or Inf")
         alpha = float(self.cfg.ft_smoothing_factor)

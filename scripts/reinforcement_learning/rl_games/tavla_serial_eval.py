@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the four remote TAVLA checkpoints serially and print success rates only."""
+"""Run the two current six-dimensional-force TAVLA checkpoints serially."""
 
 from __future__ import annotations
 
@@ -12,10 +12,8 @@ from pathlib import Path
 
 
 MODELS = (
-    ("base_50_50", 8000),
-    ("realinit_50_50", 8001),
-    ("base_70sim_30real", 8002),
-    ("realinit_70sim_30real", 8003),
+    ("real_wrench", 8001),
+    ("cotrain_wrench", 8002),
 )
 SUMMARY_RE = re.compile(
     r"\[TAVLA-SUMMARY\]\s+port=(\d+)\s+successes=(\d+)\s+"
@@ -25,13 +23,14 @@ SUMMARY_RE = re.compile(
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Serially evaluate the four TAVLA servers with no trajectory/video output."
+        description="Serially evaluate the two current TAVLA servers with no trajectory/video output."
     )
     parser.add_argument("--task", default="TacEx-RealSim-PegInsert-TAVLA-Teacher-v0")
-    parser.add_argument("--tavla-host", default="10.0.40.113")
+    parser.add_argument("--tavla-host", default="114.214.164.36")
     parser.add_argument("--episodes", type=int, default=100)
     parser.add_argument("--steps", type=int, default=600)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--reset-schedule", default=None)
     parser.add_argument("--device", default=None)
     return parser.parse_args()
 
@@ -45,6 +44,7 @@ def _run_one(
     episodes: int,
     steps: int,
     seed: int,
+    reset_schedule: str | None,
     device: str | None,
 ) -> dict[str, object]:
     command = [
@@ -67,6 +67,8 @@ def _run_one(
         "--headless",
         "--enable_cameras",
     ]
+    if reset_schedule is not None:
+        command.extend(["--reset-schedule", reset_schedule])
     if device is not None:
         command.extend(["--device", device])
 
@@ -122,6 +124,7 @@ def main() -> int:
             episodes=args.episodes,
             steps=args.steps,
             seed=args.seed,
+            reset_schedule=args.reset_schedule,
             device=args.device,
         )
         results.append((model_name, port, result))

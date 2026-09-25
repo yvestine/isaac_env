@@ -11,5 +11,8 @@ __pycache__/
 
 # Local experiment artifacts and backup copies.
 backups/
+backup/
+runs/
+.cache/
 tmp/
 *.orig

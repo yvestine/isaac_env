@@ -152,6 +152,17 @@ class RealSimEnvCfg(FactoryEnvCfg):
     # explicit so a different sensor/backend convention cannot be hidden.
     ft_raw_wrench_frame: str = "parent_body"
     ft_raw_torque_reference: str = "parent_origin"  # parent_origin or joint_anchor
+    # PhysX reports incoming wrench in the fixed joint's child frame.  Keep
+    # the directed-load identification disabled by default; physical replay
+    # enables it explicitly after the +/-XYZ validation has passed.
+    ft_apply_child_joint_frame_calibration: bool = False
+    ft_child_joint_raw_sign: float = -1.0
+    # Row-vector convention: wrench_parent = sign * wrench_raw @ R.
+    ft_child_joint_to_parent_rotation: list = [
+        -0.8577600705260422, 0.5121448519926760, -0.0442189098526944,
+        -0.4995799766843061, -0.8507909413556975, -0.1630172414292271,
+        -0.1211094889233221, -0.1177387985520807, 0.9856318110776687,
+    ]
     # The real dataset's base/stiffness pair is consistent with a base-frame
     # wrench whose torque is referenced at the robot-base origin. Keep the
     # final sign/calibration gated until a simulator contact check is done.
@@ -308,6 +319,11 @@ class RealSimEnvCfg(FactoryEnvCfg):
         "num_trajectories": 150,
         "save_failed_trajectory": False,
         "minimal_output": False,
+        # Evaluation may save only the exact camera tensors passed to the
+        # policy. Raw sensor and reward-overlay videos remain opt-in.
+        "save_policy_input_video": False,
+        "save_raw_camera_video": True,
+        "save_reward_video": True,
         "save_tavla_hdf5": True,
         "tavla_hdf5_dir": "tavla_raw",
         "immediate_stop": False,
@@ -329,7 +345,9 @@ class RealSimTaskPegInsertCfg(RealSimEnvCfg):
     task_prompt = "place a peg in a hole"
     task = RealSimPegInsert()
     disable_xy_rot = True
-    episode_length_s = 20.0
+    # Keep Pi0 peg-in-hole evaluation alive for the full 30-second rollout
+    # unless the caller explicitly overrides --episode-length-s.
+    episode_length_s = 30.0
 
 
 @configclass

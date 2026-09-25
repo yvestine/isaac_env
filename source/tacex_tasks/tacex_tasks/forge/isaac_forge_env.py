@@ -5,7 +5,7 @@
 import numpy as np
 import torch
 
-import isaacsim.core.utils.torch as torch_utils
+import tacex_tasks.torch_compat as torch_utils
 
 from isaaclab.utils.math import axis_angle_from_quat
 

@@ -234,15 +234,14 @@ class PI0RemotePolicyTAVLA(PI0RemotePolicy):
     def process_obs(self, batch):
         """Build the exact server payload used by the fine-tuned checkpoint."""
         state = self._to_single_array(batch["observation.state"]).astype(np.float32, copy=False).reshape(-1)
-        effort = self._to_single_array(batch["observation.effort"]).astype(np.float32, copy=False).reshape(-1)
+        effort = self._to_single_array(batch["observation.effort"]).astype(np.float32, copy=False)
         if state.shape != (8,):
             raise ValueError(f"TAVLA state must be (8,), got {state.shape}")
-        if effort.shape != (6,):
-            raise ValueError(f"TAVLA effort must be (6,), got {effort.shape}")
-        # The fine-tuned server signature is (batch, effort_history, 6).
-        # This checkpoint uses one current wrench frame, not a flat vector.
-        # The server adds the batch dimension; send one history frame.
-        effort = effort.reshape(1, 6)
+        if effort.shape != (10, 6):
+            raise ValueError(f"TAVLA effort must be (10, 6), got {effort.shape}")
+        # The deployed server contract is a ten-frame history, ordered from
+        # oldest to newest, with six wrench values per frame.
+        effort = np.ascontiguousarray(effort, dtype=np.float32)
 
         task = batch.get("task", "peg-in-hole")
         if isinstance(task, (list, tuple, np.ndarray)):
@@ -286,19 +285,19 @@ class PI0RemotePolicyTAVLA(PI0RemotePolicy):
         return actions
 
     def select_action(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
-        """Use current effort only for the checkpoint trained with effort_history=(0,)."""
+        """Build the ten-frame effort history required by the TAVLA server."""
         effort = batch["observation.effort"]
-        if getattr(self.config, "num_history_steps", 1) <= 1:
-            batch["observation.effort"] = effort
-        else:
-            self.effort_history_list.append(effort)
-            history_efforts = []
-            for idx in self.config.history_idx:
-                if len(self.effort_history_list) + idx >= 0:
-                    history_efforts.append(self.effort_history_list[idx])
-                else:
-                    history_efforts.append(self.effort_history_list[0])
-            batch["observation.effort"] = torch.stack(history_efforts, dim=0).permute(1, 0, 2)
+        self.effort_history_list.append(effort)
+        history_idx = getattr(self.config, "history_idx", None)
+        if history_idx is None or len(history_idx) != 10:
+            history_idx = list(range(-37, 0, 4))
+        history_efforts = []
+        for idx in history_idx:
+            if len(self.effort_history_list) + idx >= 0:
+                history_efforts.append(self.effort_history_list[idx])
+            else:
+                history_efforts.append(self.effort_history_list[0])
+        batch["observation.effort"] = torch.stack(history_efforts, dim=0).permute(1, 0, 2)
         return super().select_action(batch)
 import logging
 
