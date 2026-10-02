@@ -17,7 +17,7 @@ from pathlib import Path
 import h5py
 import numpy as np
 
-ROOT = Path("/home/sutai/workspace/gujiawei/isaac_env")
+ROOT = Path(__file__).resolve().parents[1]
 SIM = ROOT / "sim-data"
 GRIPPER_MAX_WIDTH_M = 0.08
 GRIPPER_GRASP_POS = 0.0865

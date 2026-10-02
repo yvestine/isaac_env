@@ -1,0 +1,362 @@
+[
+  {
+    "trajectory": 0,
+    "frames": 267,
+    "force_source": "sim/force/panda_link7_wrench_calibrated",
+    "sign": -1.0,
+    "scale": 1.0,
+    "force_norm_p95_n": 0.41586201101494363,
+    "force_norm_max_n": 0.8847512652556166
+  },
+  {
+    "trajectory": 1,
+    "frames": 188,
+    "force_source": "sim/force/panda_link7_wrench_calibrated",
+    "sign": -1.0,
+    "scale": 1.0,
+    "force_norm_p95_n": 0.15115522861079114,
+    "force_norm_max_n": 0.24447564550859172
+  },
+  {
+    "trajectory": 2,
+    "frames": 186,
+    "force_source": "sim/force/panda_link7_wrench_calibrated",
+    "sign": -1.0,
+    "scale": 1.0,
+    "force_norm_p95_n": 0.3695097550260998,
+    "force_norm_max_n": 0.5078055139996789
+  },
+  {
+    "trajectory": 3,
+    "frames": 167,
+    "force_source": "sim/force/panda_link7_wrench_calibrated",
+    "sign": -1.0,
+    "scale": 1.0,
+    "force_norm_p95_n": 0.5832908992398256,
+    "force_norm_max_n": 1.3364181051638635
+  },
+  {
+    "trajectory": 4,
+    "frames": 178,
+    "force_source": "sim/force/panda_link7_wrench_calibrated",
+    "sign": -1.0,
+    "scale": 1.0,
+    "force_norm_p95_n": 0.38151899641435816,
+    "force_norm_max_n": 0.4376858736744331
+  },
+  {
+    "trajectory": 5,
+    "frames": 172,
+    "force_source": "sim/force/panda_link7_wrench_calibrated",
+    "sign": -1.0,
+    "scale": 1.0,
+    "force_norm_p95_n": 0.5166893313574752,
+    "force_norm_max_n": 0.8356158589134921
+  },
+  {
+    "trajectory": 6,
+    "frames": 177,
+    "force_source": "sim/force/panda_link7_wrench_calibrated",
+    "sign": -1.0,
+    "scale": 1.0,
+    "force_norm_p95_n": 0.26489996423208045,
+    "force_norm_max_n": 0.4229917499653688
+  },
+  {
+    "trajectory": 7,
+    "frames": 253,
+    "force_source": "sim/force/panda_link7_wrench_calibrated",
+    "sign": -1.0,
+    "scale": 1.0,
+    "force_norm_p95_n": 0.6986392330320308,
+    "force_norm_max_n": 1.3060292536160552
+  },
+  {
+    "trajectory": 8,
+    "frames": 184,
+    "force_source": "sim/force/panda_link7_wrench_calibrated",
+    "sign": -1.0,
+    "scale": 1.0,
+    "force_norm_p95_n": 0.787894428574451,
+    "force_norm_max_n": 1.399326422666271
+  },
+  {
+    "trajectory": 9,
+    "frames": 368,
+    "force_source": "sim/force/panda_link7_wrench_calibrated",
+    "sign": -1.0,
+    "scale": 1.0,
+    "force_norm_p95_n": 0.9606064172239774,
+    "force_norm_max_n": 1.8137119267861601
+  },
+  {
+    "trajectory": 10,
+    "frames": 320,
+    "force_source": "sim/force/panda_link7_wrench_calibrated",
+    "sign": -1.0,
+    "scale": 1.0,
+    "force_norm_p95_n": 0.49023186569831717,
+    "force_norm_max_n": 1.1407133728860526
+  },
+  {
+    "trajectory": 11,
+    "frames": 185,
+    "force_source": "sim/force/panda_link7_wrench_calibrated",
+    "sign": -1.0,
+    "scale": 1.0,
+    "force_norm_p95_n": 3.5440456529820437,
+    "force_norm_max_n": 4.365602213585181
+  },
+  {
+    "trajectory": 12,
+    "frames": 256,
+    "force_source": "sim/force/panda_link7_wrench_calibrated",
+    "sign": -1.0,
+    "scale": 1.0,
+    "force_norm_p95_n": 16.63611702460161,
+    "force_norm_max_n": 17.60371939631194
+  },
+  {
+    "trajectory": 13,
+    "frames": 291,
+    "force_source": "sim/force/panda_link7_wrench_calibrated",
+    "sign": -1.0,
+    "scale": 1.0,
+    "force_norm_p95_n": 1.4067875520891533,
+    "force_norm_max_n": 2.246139735315724
+  },
+  {
+    "trajectory": 14,
+    "frames": 153,
+    "force_source": "sim/force/panda_link7_wrench_calibrated",
+    "sign": -1.0,
+    "scale": 1.0,
+    "force_norm_p95_n": 2.588365545696583,
+    "force_norm_max_n": 3.958371639054126
+  },
+  {
+    "trajectory": 15,
+    "frames": 133,
+    "force_source": "sim/force/panda_link7_wrench_calibrated",
+    "sign": -1.0,
+    "scale": 1.0,
+    "force_norm_p95_n": 1.77370289854907,
+    "force_norm_max_n": 2.3639392477995598
+  },
+  {
+    "trajectory": 16,
+    "frames": 230,
+    "force_source": "sim/force/panda_link7_wrench_calibrated",
+    "sign": -1.0,
+    "scale": 1.0,
+    "force_norm_p95_n": 1.3062456404123366,
+    "force_norm_max_n": 2.288895693485891
+  },
+  {
+    "trajectory": 17,
+    "frames": 265,
+    "force_source": "sim/force/panda_link7_wrench_calibrated",
+    "sign": -1.0,
+    "scale": 1.0,
+    "force_norm_p95_n": 2.119084164881536,
+    "force_norm_max_n": 4.4633883989299505
+  },
+  {
+    "trajectory": 18,
+    "frames": 138,
+    "force_source": "sim/force/panda_link7_wrench_calibrated",
+    "sign": -1.0,
+    "scale": 1.0,
+    "force_norm_p95_n": 2.0683136275550473,
+    "force_norm_max_n": 2.6009326123681227
+  },
+  {
+    "trajectory": 19,
+    "frames": 148,
+    "force_source": "sim/force/panda_link7_wrench_calibrated",
+    "sign": -1.0,
+    "scale": 1.0,
+    "force_norm_p95_n": 2.0575694515285115,
+    "force_norm_max_n": 2.466823985000456
+  },
+  {
+    "trajectory": 20,
+    "frames": 237,
+    "force_source": "sim/force/panda_link7_wrench_calibrated",
+    "sign": -1.0,
+    "scale": 1.0,
+    "force_norm_p95_n": 1.833185306308375,
+    "force_norm_max_n": 2.7898101561258706
+  },
+  {
+    "trajectory": 21,
+    "frames": 197,
+    "force_source": "sim/force/panda_link7_wrench_calibrated",
+    "sign": -1.0,
+    "scale": 1.0,
+    "force_norm_p95_n": 1.6430333755646636,
+    "force_norm_max_n": 2.203034824512144
+  },
+  {
+    "trajectory": 22,
+    "frames": 169,
+    "force_source": "sim/force/panda_link7_wrench_calibrated",
+    "sign": -1.0,
+    "scale": 1.0,
+    "force_norm_p95_n": 1.6832743027515458,
+    "force_norm_max_n": 2.42053793605153
+  },
+  {
+    "trajectory": 23,
+    "frames": 167,
+    "force_source": "sim/force/panda_link7_wrench_calibrated",
+    "sign": -1.0,
+    "scale": 1.0,
+    "force_norm_p95_n": 1.8471726914354634,
+    "force_norm_max_n": 2.450828409062307
+  },
+  {
+    "trajectory": 24,
+    "frames": 173,
+    "force_source": "sim/force/panda_link7_wrench_calibrated",
+    "sign": -1.0,
+    "scale": 1.0,
+    "force_norm_p95_n": 1.5941199444387517,
+    "force_norm_max_n": 2.9901300870167122
+  },
+  {
+    "trajectory": 25,
+    "frames": 193,
+    "force_source": "sim/force/panda_link7_wrench_calibrated",
+    "sign": -1.0,
+    "scale": 1.0,
+    "force_norm_p95_n": 1.30305495221255,
+    "force_norm_max_n": 2.8736949589706677
+  },
+  {
+    "trajectory": 26,
+    "frames": 103,
+    "force_source": "sim/force/panda_link7_wrench_calibrated",
+    "sign": -1.0,
+    "scale": 1.0,
+    "force_norm_p95_n": 3.0529485814414117,
+    "force_norm_max_n": 3.7536796568893287
+  },
+  {
+    "trajectory": 27,
+    "frames": 150,
+    "force_source": "sim/force/panda_link7_wrench_calibrated",
+    "sign": -1.0,
+    "scale": 1.0,
+    "force_norm_p95_n": 1.4568468230247018,
+    "force_norm_max_n": 3.184963897254517
+  },
+  {
+    "trajectory": 28,
+    "frames": 164,
+    "force_source": "sim/force/panda_link7_wrench_calibrated",
+    "sign": -1.0,
+    "scale": 1.0,
+    "force_norm_p95_n": 2.106297401436273,
+    "force_norm_max_n": 3.5682473548014912
+  },
+  {
+    "trajectory": 29,
+    "frames": 168,
+    "force_source": "sim/force/panda_link7_wrench_calibrated",
+    "sign": -1.0,
+    "scale": 1.0,
+    "force_norm_p95_n": 1.6899575388129198,
+    "force_norm_max_n": 3.7273688087949517
+  },
+  {
+    "trajectory": 30,
+    "frames": 105,
+    "force_source": "sim/force/panda_link7_wrench_calibrated",
+    "sign": -1.0,
+    "scale": 1.0,
+    "force_norm_p95_n": 7.422868737626101,
+    "force_norm_max_n": 8.078946648213357
+  },
+  {
+    "trajectory": 31,
+    "frames": 102,
+    "force_source": "sim/force/panda_link7_wrench_calibrated",
+    "sign": -1.0,
+    "scale": 1.0,
+    "force_norm_p95_n": 3.2882208598648903,
+    "force_norm_max_n": 3.8565240942717463
+  },
+  {
+    "trajectory": 32,
+    "frames": 153,
+    "force_source": "sim/force/panda_link7_wrench_calibrated",
+    "sign": -1.0,
+    "scale": 1.0,
+    "force_norm_p95_n": 1.8060742013706448,
+    "force_norm_max_n": 4.578114193887104
+  },
+  {
+    "trajectory": 33,
+    "frames": 128,
+    "force_source": "sim/force/panda_link7_wrench_calibrated",
+    "sign": -1.0,
+    "scale": 1.0,
+    "force_norm_p95_n": 2.811839090334317,
+    "force_norm_max_n": 4.422113377328078
+  },
+  {
+    "trajectory": 34,
+    "frames": 214,
+    "force_source": "sim/force/panda_link7_wrench_calibrated",
+    "sign": -1.0,
+    "scale": 1.0,
+    "force_norm_p95_n": 3.608671355565482,
+    "force_norm_max_n": 5.838271679841654
+  },
+  {
+    "trajectory": 35,
+    "frames": 117,
+    "force_source": "sim/force/panda_link7_wrench_calibrated",
+    "sign": -1.0,
+    "scale": 1.0,
+    "force_norm_p95_n": 3.675832472906985,
+    "force_norm_max_n": 4.408587638159487
+  },
+  {
+    "trajectory": 36,
+    "frames": 100,
+    "force_source": "sim/force/panda_link7_wrench_calibrated",
+    "sign": -1.0,
+    "scale": 1.0,
+    "force_norm_p95_n": 4.001843797386224,
+    "force_norm_max_n": 4.610193899490106
+  },
+  {
+    "trajectory": 37,
+    "frames": 99,
+    "force_source": "sim/force/panda_link7_wrench_calibrated",
+    "sign": -1.0,
+    "scale": 1.0,
+    "force_norm_p95_n": 5.577025481593157,
+    "force_norm_max_n": 6.902104142243128
+  },
+  {
+    "trajectory": 38,
+    "frames": 115,
+    "force_source": "sim/force/panda_link7_wrench_calibrated",
+    "sign": -1.0,
+    "scale": 1.0,
+    "force_norm_p95_n": 2.1331963467608626,
+    "force_norm_max_n": 4.246985708517497
+  },
+  {
+    "trajectory": 39,
+    "frames": 75,
+    "force_source": "sim/force/panda_link7_wrench_calibrated",
+    "sign": -1.0,
+    "scale": 1.0,
+    "force_norm_p95_n": 3.8317790335608493,
+    "force_norm_max_n": 4.437091679196251
+  }
+]

@@ -689,21 +689,16 @@ class Pi0RealSimEnv(RealSimEnv):
         cfg.task.fixed_asset.init_state.pos = tuple(cfg.pi0_hole_init_pos)
         cfg.task.fixed_asset.init_state.rot = tuple(cfg.pi0_hole_init_rot)
         cfg.robot.init_state.rot = tuple(cfg.pi0_robot_init_rot)
-        # The shared RealSim robot intentionally has zero arm actuator gains
-        # for its task-space torque controller. Pi0 uses absolute joint
-        # targets, so give this Pi0-only articulation a stable implicit PD
-        # actuator instead of adding an independent hand-written torque loop.
+        # Pi0 uses absolute joint targets, so restore the implicit position
+        # drive used by the old TAVLA test instead of zeroing the articulation.
         if hasattr(cfg.robot, "actuators"):
             for actuator_name in ("panda_arm1", "panda_arm2"):
                 actuator = cfg.robot.actuators.get(actuator_name)
                 if actuator is not None:
                     actuator.stiffness = float(cfg.pi0_policy_cfg.implicit_arm_stiffness)
                     actuator.damping = float(cfg.pi0_policy_cfg.implicit_arm_damping)
-        # Keep long randomized evaluations from spending unbounded CPU time
-        # on a high-force peg/finger/hole contact manifold.  The authored
-        # RealSim assets use 192 position iterations and a 5 mm robot contact
-        # shell; those settings are unnecessary for this 8 mm peg and can
-        # make a bad edge contact dominate the whole Isaac process.
+        # Keep the authored contact solver settings used by the old physical
+        # grasp test.  The force-trend path only changes observations.
         for asset_cfg in (cfg.robot, cfg.task.fixed_asset, cfg.task.held_asset):
             rigid_props = getattr(asset_cfg.spawn, "rigid_props", None)
             if rigid_props is not None:
@@ -841,8 +836,18 @@ class Pi0RealSimEnv(RealSimEnv):
 
         if self.num_envs != 1:
             raise ValueError("Pi0 remote evaluation currently supports num_envs=1")
-        self._pi0_policy = PI0RemoteJointPolicy(cfg.pi0_policy_cfg)
+        self._pi0_policy = self._create_pi0_policy(cfg.pi0_policy_cfg)
         self._pi0_ready = True
+
+    def _create_pi0_policy(self, policy_cfg):
+        """Construct the remote policy; specialized tasks may override it."""
+
+        return PI0RemoteJointPolicy(policy_cfg)
+
+    def _before_pi0_runtime_reset(self, env_ids) -> None:
+        """Hook for reset-contract checks before the first remote request."""
+
+        return None
 
     @property
     def _pi0_cfg(self):
@@ -969,6 +974,23 @@ class Pi0RealSimEnv(RealSimEnv):
 
     def randomize_initial_state(self, env_ids):
         """Reset Pi0 with the IsaacLab 6 XYZW hand-down pose."""
+        reset_trace_enabled = not getattr(self, "_pi0_reset_trace_logged", False)
+        reset_trace_env_id = int(env_ids[0].detach().cpu()) if reset_trace_enabled else 0
+
+        def trace_reset_stage(stage: str) -> None:
+            if not reset_trace_enabled:
+                return
+            q = self.joint_pos[reset_trace_env_id, :7].detach().cpu().numpy()
+            q_target = self.ctrl_target_joint_pos[reset_trace_env_id, :7].detach().cpu().numpy()
+            q_vel = self.joint_vel[reset_trace_env_id, :7].detach().cpu().numpy()
+            print(
+                f"[Pi0ResetTrace] {stage} "
+                f"q={np.array2string(q, precision=6)} "
+                f"target={np.array2string(q_target, precision=6)} "
+                f"vel={np.array2string(q_vel, precision=6)} "
+                f"finger={self.joint_pos[reset_trace_env_id, 7:9].detach().cpu().numpy()}"
+            , flush=True)
+
         physics_sim_view = sim_utils.SimulationContext.instance().physics_sim_view
         physics_sim_view.set_gravity(carb.Float3(0.0, 0.0, 0.0))
 
@@ -1022,6 +1044,7 @@ class Pi0RealSimEnv(RealSimEnv):
         self._fixed_asset.reset()
         self.init_fixed_pos_obs_noise[env_ids].zero_()
         self.step_sim_no_action()
+        trace_reset_stage("after_fixed_step")
 
         identity_quat = torch.zeros((self.num_envs, 4), device=self.device)
         identity_quat[:, 3] = 1.0
@@ -1110,7 +1133,9 @@ class Pi0RealSimEnv(RealSimEnv):
                         env_ids=bad_envs,
                     )
 
+        trace_reset_stage("after_arm_reset_write")
         self.step_sim_no_action()
+        trace_reset_stage("after_arm_reset_step")
 
         # Place the held peg using the same XYZW frame chain as PPO/replay.
         zero_pos = torch.zeros((self.num_envs, 3), device=self.device)
@@ -1149,12 +1174,14 @@ class Pi0RealSimEnv(RealSimEnv):
             reset_task_prop_gains, self.cfg.ctrl.reset_rot_deriv_scale
         )
         self.step_sim_no_action()
+        trace_reset_stage("after_peg_step")
         grasp_time = 0.0
         while grasp_time < 0.6:
             self.ctrl_target_joint_pos[env_ids, 7:] = 0.0
             self.close_gripper_in_place()
             self.step_sim_no_action()
             grasp_time += self.physics_dt
+        trace_reset_stage("after_grasp")
 
         settle_time = 0.0
         while settle_time < 0.2:
@@ -1162,6 +1189,7 @@ class Pi0RealSimEnv(RealSimEnv):
             self.close_gripper_in_place()
             self.step_sim_no_action()
             settle_time += self.physics_dt
+        trace_reset_stage("after_settle")
 
         # Match rollout's final post-grasp snap. Without this write, the
         # independent HeldAsset can settle away from the fingertip during the
@@ -1216,6 +1244,8 @@ class Pi0RealSimEnv(RealSimEnv):
         # Copy only after the active arm has completed its reset IK/grasp
         # sequence; the right arm remains visual-only afterwards.
         self._sync_pi0_static_right_arm_to_left()
+        trace_reset_stage("before_restore_gravity")
+        self._pi0_reset_trace_logged = True
         physics_sim_view.set_gravity(carb.Float3(*self.cfg.sim.gravity))
 
     def _joint_limits(self):
@@ -1559,12 +1589,11 @@ class Pi0RealSimEnv(RealSimEnv):
         self._pi0_command_q = current[:, :7].detach().clone()
         self._pi0_desired_q = current[:, :7].detach().clone()
         self._pi0_command_gripper = current[:, 7].detach().clone()
-        # Keep a finite closed preload while Pi0 controls the arm.  Holding
-        # the measured post-grasp opening removes the preload, while a zero
-        # target can drive both fingers into the 40 N/side actuator limit when
-        # the peg contacts the hole.  A 2.5 mm target gives roughly 25 N per
-        # finger at the measured 5.8 mm contact opening.
-        self._pi0_finger_hold_target = torch.full_like(self.joint_pos[:, 7:9], 0.0025)
+        # Restore the old finite preload used by the physical test.  Holding
+        # the reset opening leaves the peg loose as soon as the arm moves.
+        self._pi0_finger_hold_target = torch.full_like(
+            self.joint_pos[:, 7:9], 0.0025
+        )
         self._pi0_wrist_hold_target = self.joint_pos[:, 4:7].detach().clone()
         self._pi0_target = current.detach().clone()
         self._pi0_chunk = np.empty((0, 8), dtype=np.float32)
@@ -1595,6 +1624,8 @@ class Pi0RealSimEnv(RealSimEnv):
     def _apply_action(self):
         if not self._pi0_ready or self._pi0_target is None:
             return super()._apply_action()
+        if getattr(self, "_sim_data_disable_runtime_control", False):
+            return
         if self.last_update_timestamp < self._robot._data._sim_timestamp:
             self._compute_intermediate_values(dt=self.physics_dt)
 
@@ -1612,6 +1643,23 @@ class Pi0RealSimEnv(RealSimEnv):
 
         self.ctrl_target_joint_pos[:, :7] = q_target
         self.ctrl_target_joint_pos[:, 7:9] = finger_target
+
+        if not getattr(self, "_pi0_controller_branch_logged", False):
+            print(
+                "[Pi0Controller] branch="
+                + (
+                    "taskspace"
+                    if getattr(self._pi0_cfg, "use_taskspace_controller", True)
+                    else "implicit_joint_position"
+                    if getattr(self._pi0_cfg, "use_implicit_position_controller", True)
+                    else "explicit_joint_pd"
+                )
+                + f" ready={self._pi0_ready} q={self.joint_pos[0, :7].detach().cpu().tolist()}"
+                + f" target={q_target[0].detach().cpu().tolist()}"
+                + f" vel={self.joint_vel[0, :7].detach().cpu().tolist()}",
+                flush=True,
+            )
+            self._pi0_controller_branch_logged = True
 
         if getattr(self._pi0_cfg, "use_taskspace_controller", True):
             # Task-space mode is optional. Only this mode may alter the
@@ -1664,6 +1712,7 @@ class Pi0RealSimEnv(RealSimEnv):
         # first. Copy that final q once; the right arm remains visual-only.
         self._sync_pi0_static_right_arm_to_left()
         if self._pi0_ready:
+            self._before_pi0_runtime_reset(env_ids)
             self._reset_pi0_runtime()
 
     def close(self):

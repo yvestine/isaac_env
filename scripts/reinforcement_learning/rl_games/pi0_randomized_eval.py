@@ -8,6 +8,7 @@ import csv
 import json
 import logging
 import os
+import shutil
 import tempfile
 import time
 from datetime import datetime
@@ -21,6 +22,7 @@ from isaaclab.app import AppLauncher
 
 PI0_TASK = "TacEx-RealSim-PegInsert-PI0-Direct-v0"
 TAVLA_TASK = "TacEx-RealSim-PegInsert-TAVLA-Teacher-v0"
+SIM_DATA_ALIGNED_TASK = "TacEx-RealSim-PegInsert-SimDataAligned-v0"
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument(
@@ -30,11 +32,35 @@ parser.add_argument(
     help="Policy backend. If omitted, infer it from --task; the default is Pi0.",
 )
 parser.add_argument("--task", type=str, default=None)
-parser.add_argument("--pi0-host", type=str, default="114.214.164.36")
-parser.add_argument("--pi0-port", type=int, default=8000)
-parser.add_argument("--tavla-host", type=str, default="114.214.164.36")
-parser.add_argument("--tavla-port", type=int, choices=(8000, 8001), default=8000)
+parser.add_argument("--pi0-host", type=str, default=os.environ.get("POLICY_HOST", "114.214.164.36"))
+parser.add_argument("--pi0-port", type=int, default=int(os.environ.get("PI0_PORT", "8000")))
+parser.add_argument("--tavla-host", type=str, default=os.environ.get("POLICY_HOST", "114.214.164.36"))
+parser.add_argument(
+    "--tavla-port",
+    type=int,
+    choices=(8000, 8001),
+    default=int(os.environ.get("TAVLA_PORT", "8000")),
+)
 parser.add_argument("--tavla-action-start-index", type=int, default=5)
+parser.add_argument(
+    "--sim-data-profile-id",
+    type=int,
+    default=None,
+    help="Use one sim-data-aligned profile with the force-trend model.",
+)
+parser.add_argument("--sim-data-dir", type=Path, default=Path("sim-data"))
+parser.add_argument("--sim-data-aligned-dir", type=Path, default=Path("sim-data-aligned"))
+parser.add_argument("--openpi-root", type=Path, default=Path("sim_side_test_bundle"))
+parser.add_argument(
+    "--wrench-adapter",
+    type=Path,
+    default=Path("sim_side_test_bundle/assets/wrench_adapters/sim_aligned_to_real_affine.pt"),
+)
+parser.add_argument(
+    "--force-trend-config",
+    type=Path,
+    default=Path("sim_side_test_bundle/configs/tavla_sim_force_trend_affine.json"),
+)
 parser.add_argument(
     "--tavla-force-gate",
     action="store_true",
@@ -104,9 +130,20 @@ parser.add_argument(
     action="store_true",
     help="Save episodes directly under --output-dir instead of a run_TIMESTAMP child.",
 )
+parser.add_argument(
+    "--overwrite-output",
+    action="store_true",
+    help="Clear the selected flat output directory before starting.",
+)
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
 
+if args.sim_data_profile_id is not None:
+    if args.sim_data_profile_id < 0:
+        raise ValueError("--sim-data-profile-id must be non-negative")
+    args.policy = "tavla"
+    args.task = SIM_DATA_ALIGNED_TASK
+    args.flat_output = True
 if args.policy is None:
     args.policy = "tavla" if args.task and "TAVLA" in args.task.upper() else "pi0"
 if args.task is None:
@@ -352,6 +389,22 @@ def _create_run_directory(output_root: Path, flat: bool = False) -> Path:
     return candidate
 
 
+def _clear_output_directory(output_root: Path) -> None:
+    """Clear one explicitly selected run directory without deleting its root."""
+
+    resolved = output_root.expanduser().resolve()
+    protected = {Path("/").resolve(), Path.cwd().resolve(), Path.home().resolve()}
+    if resolved in protected or len(resolved.parts) < 3:
+        raise ValueError(f"Refusing to clear unsafe output directory: {resolved}")
+    if not resolved.exists():
+        return
+    for child in resolved.iterdir():
+        if child.is_dir() and not child.is_symlink():
+            shutil.rmtree(child)
+        else:
+            child.unlink()
+
+
 def _write_episode_csv(
     path: Path,
     rows: list[dict[str, object]],
@@ -380,6 +433,7 @@ def _write_episode_csv(
         "initial_z_disp_m",
         "best_xy_error_m",
         "minimum_z_disp_m",
+        "minimum_z_disp_when_xy_lt_3mm_m",
         "partial_insertion",
         "partial_insertion_first_step",
     ]
@@ -427,11 +481,14 @@ def _load_completed_rows(path: Path, episodes: int) -> list[dict[str, object]]:
 
 def main() -> None:
     reset_schedule = _load_reset_schedule(args.reset_schedule, args.episodes)
-    tavla_direct_reset_joints_schedule = (
-        _load_pi0_reset_joint_schedule(args.tavla_pi0_reset_dir, args.episodes)
-        if is_tavla
-        else None
-    )
+    if args.sim_data_profile_id is not None:
+        tavla_direct_reset_joints_schedule = None
+    else:
+        tavla_direct_reset_joints_schedule = (
+            _load_pi0_reset_joint_schedule(args.tavla_pi0_reset_dir, args.episodes)
+            if is_tavla
+            else None
+        )
     env_cfg = parse_env_cfg(
         args.task,
         device=args.device,
@@ -440,6 +497,13 @@ def main() -> None:
     )
     env_cfg.seed = int(args.eval_seed)
     env_cfg.episode_length_s = float(args.episode_length_s)
+    if args.sim_data_profile_id is not None:
+        env_cfg.sim_data_profile_id = int(args.sim_data_profile_id)
+        env_cfg.sim_data_dir = str(args.sim_data_dir)
+        env_cfg.sim_data_aligned_dir = str(args.sim_data_aligned_dir)
+        env_cfg.openpi_root = str(args.openpi_root)
+        env_cfg.wrench_adapter_path = str(args.wrench_adapter)
+        env_cfg.force_trend_config_path = str(args.force_trend_config)
     # RealSimEnv contains a legacy process-level exit guard for data
     # collection.  This evaluator owns the episode loop and must be allowed
     # to write its aggregate CSV/JSON before closing Isaac Sim.
@@ -513,6 +577,10 @@ def main() -> None:
         env_cfg.pi0_hand_position_noise_m = tuple(args.hand_position_range_m)
     # Fixed reset-schedule evaluations are deliberately written directly into
     # the requested directory so the 80 episode folders remain episode_0..79.
+    if args.overwrite_output:
+        if not (args.flat_output or args.reset_schedule is not None):
+            raise ValueError("--overwrite-output requires --flat-output")
+        _clear_output_directory(args.output_dir)
     run_output_dir = _create_run_directory(
         args.output_dir,
         flat=args.flat_output or args.reset_schedule is not None,
@@ -546,6 +614,9 @@ def main() -> None:
             env = gym.make(args.task, cfg=env_cfg, output_dir=str(run_output_dir))
             raw_env = env.unwrapped
             if is_tavla:
+                if args.sim_data_profile_id is not None:
+                    reset_q = raw_env.sim_data_profile.initial_joint_pos.tolist()
+                    tavla_direct_reset_joints_schedule = [reset_q] * int(args.episodes)
                 raw_env.tavla_direct_reset_joints_schedule = tavla_direct_reset_joints_schedule
             if reset_schedule is not None:
                 if is_tavla:
@@ -569,6 +640,7 @@ def main() -> None:
         episode_return = 0.0
         best_xy_error = float(reset_info["initial_xy_error_m"])
         minimum_z_disp = float(reset_info["initial_z_disp_m"])
+        minimum_z_when_xy_lt_3mm = None
         partial_insertion_seen = False
         partial_insertion_first_step = None
         runtime_stats = _policy_runtime_stats(raw_env, is_tavla)
@@ -592,6 +664,13 @@ def main() -> None:
             before_step = _insertion_metrics(raw_env)
             best_xy_error = min(best_xy_error, float(before_step["xy_error_m"]))
             minimum_z_disp = min(minimum_z_disp, float(before_step["z_disp_m"]))
+            if float(before_step["xy_error_m"]) < 0.003:
+                current_z = float(before_step["z_disp_m"])
+                minimum_z_when_xy_lt_3mm = (
+                    current_z
+                    if minimum_z_when_xy_lt_3mm is None
+                    else min(minimum_z_when_xy_lt_3mm, current_z)
+                )
             if bool(before_step["partial_insertion"]):
                 if not partial_insertion_seen:
                     partial_insertion_first_step = episode_steps
@@ -660,6 +739,7 @@ def main() -> None:
                 "initial_z_disp_m": reset_info["initial_z_disp_m"],
                 "best_xy_error_m": best_xy_error,
                 "minimum_z_disp_m": minimum_z_disp,
+                "minimum_z_disp_when_xy_lt_3mm_m": minimum_z_when_xy_lt_3mm,
                 "partial_insertion": int(partial_insertion_seen),
                 "partial_insertion_first_step": partial_insertion_first_step,
             }
@@ -702,6 +782,7 @@ def main() -> None:
             episode_return = 0.0
             best_xy_error = float(reset_info["initial_xy_error_m"])
             minimum_z_disp = float(reset_info["initial_z_disp_m"])
+            minimum_z_when_xy_lt_3mm = None
             partial_insertion_seen = False
             partial_insertion_first_step = None
             runtime_stats = _policy_runtime_stats(raw_env, is_tavla)

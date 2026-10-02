@@ -61,8 +61,11 @@ parser.add_argument("--hole-offset-z", type=float, default=0.0)
 parser.add_argument(
     "--link7-cutoff-hz",
     type=float,
-    default=1.2,
-    help="Causal low-pass cutoff for the panda_link7 wrench after de-spiking.",
+    default=0.35,
+    help=(
+        "Causal low-pass cutoff used when --force-alignment-config is omitted. "
+        "The online-aligned default is 0.35 Hz."
+    ),
 )
 parser.add_argument(
     "--contact-feedback-cutoff-hz",
@@ -73,12 +76,27 @@ parser.add_argument(
 parser.add_argument(
     "--link7-force-gain",
     type=float,
-    default=10.0,
+    default=1.0,
     help=(
-        "Global post-filter gain for the panda_link7 wrench. Raw and unscaled "
-        "filtered streams remain available for diagnosis."
+        "Legacy global post-filter gain. Online base-frame alignment requires "
+        "the identity value 1.0."
     ),
 )
+parser.add_argument(
+    "--force-alignment-config",
+    type=Path,
+    default=None,
+    help=(
+        "Optional causal_force_alignment_v1 JSON. If omitted, the deployable "
+        "identity-baseline 0.35 Hz configuration is used."
+    ),
+)
+parser.add_argument(
+    "--add-force-model-noise",
+    action="store_true",
+    help="Add the configured deterministic AR(1) residual to force_model only.",
+)
+parser.add_argument("--force-noise-seed", type=int, default=0)
 parser.add_argument(
     "--link7-frame-calibration",
     type=Path,
@@ -102,6 +120,20 @@ parser.add_argument(
     help="Record explicit PhysX peg-hole normal and friction forces without changing replay control.",
 )
 parser.add_argument(
+    "--contact-offset-m",
+    type=float,
+    default=None,
+    help="Optional common peg/hole collision contact offset for physical-force fitting.",
+)
+parser.add_argument("--held-static-friction", type=float, default=None)
+parser.add_argument("--held-dynamic-friction", type=float, default=None)
+parser.add_argument("--fixed-static-friction", type=float, default=None)
+parser.add_argument("--fixed-dynamic-friction", type=float, default=None)
+parser.add_argument("--task-kp-scale", type=float, default=1.0)
+parser.add_argument("--task-kd-scale", type=float, default=1.0)
+parser.add_argument("--solver-position-iterations", type=int, default=None)
+parser.add_argument("--solver-velocity-iterations", type=int, default=None)
+parser.add_argument(
     "--sim-fk-csv",
     type=Path,
     default=None,
@@ -124,6 +156,23 @@ if args.contact_feedback_cutoff_hz <= 0.0:
     raise ValueError("--contact-feedback-cutoff-hz must be positive")
 if args.link7_force_gain <= 0.0:
     raise ValueError("--link7-force-gain must be positive")
+if args.contact_offset_m is not None and args.contact_offset_m < 0.0:
+    raise ValueError("--contact-offset-m must be non-negative")
+for _name in (
+    "held_static_friction",
+    "held_dynamic_friction",
+    "fixed_static_friction",
+    "fixed_dynamic_friction",
+):
+    _value = getattr(args, _name)
+    if _value is not None and _value < 0.0:
+        raise ValueError(f"--{_name.replace('_', '-')} must be non-negative")
+if args.task_kp_scale <= 0.0 or args.task_kd_scale <= 0.0:
+    raise ValueError("task controller gain scales must be positive")
+for _name in ("solver_position_iterations", "solver_velocity_iterations"):
+    _value = getattr(args, _name)
+    if _value is not None and _value < 1:
+        raise ValueError(f"--{_name.replace('_', '-')} must be positive")
 # Keep the same Isaac Sim 6 startup workaround as the verified joint replay:
 # RTX geometry streaming can leave Fabric/USD render meshes out of sync.
 _kit_args = (
@@ -171,6 +220,13 @@ from tacex_tasks.real2sim.pi0_env import (  # noqa: E402
 )
 from tacex_tasks.real2sim.pi0_env_cfg import RealSimPi0PegInsertCfg  # noqa: E402
 from tacex_tasks.real2sim.realsim_env import RealSimEnv, _write_h264_mp4  # noqa: E402
+from tacex_tasks.real2sim.force_alignment import (  # noqa: E402
+    FORCE_ALIGNMENT_VERSION,
+    ForceAlignmentConfig,
+    force_to_zero_torque_wrench,
+    interval_mean_to_frames,
+    process_force_series,
+)
 
 
 def create_physics_free_background_usd() -> Path:
@@ -506,6 +562,22 @@ def load_link7_frame_calibration(path: Path | None) -> dict[str, object] | None:
         raise ValueError("link7 frame calibration did not apply force at panda_link7")
     if not bool(result.get("summary", {}).get("passed", False)):
         raise RuntimeError("panda_link7 directed-force calibration did not pass")
+    summary = result.get("summary", {})
+    leakage_limit = float(summary.get("cross_axis_leakage_limit", 0.15))
+    if leakage_limit > 0.15 + 1.0e-12:
+        raise RuntimeError(
+            "panda_link7 calibration used a cross-axis leakage limit above 15%"
+        )
+    directions = result.get("directions")
+    if not isinstance(directions, list) or len(directions) != 6:
+        raise ValueError("panda_link7 calibration must contain six directed +/-XYZ tests")
+    for direction in directions:
+        leakage = float(direction.get("cross_axis_leakage_ratio", np.inf))
+        if direction.get("passed") is not True or leakage > 0.15 + 1.0e-12:
+            raise RuntimeError(
+                "panda_link7 directed-force calibration exceeds 15% cross-axis leakage: "
+                f"{direction.get('label', '?')}={leakage:.6f}"
+            )
     frame = result.get("frame_calibration")
     if not isinstance(frame, dict):
         raise ValueError("link7 frame calibration has no fitted frame transform")
@@ -1106,6 +1178,8 @@ def step_ppo_physics(
         if incoming_body_index is not None and incoming_frame_calibration is not None
         else None
     )
+    incoming_joint_pos_samples = [] if incoming_body_index is not None else None
+    incoming_joint_vel_samples = [] if incoming_body_index is not None else None
     for step_index in range(step_count):
         alpha = float(step_index + 1) / float(step_count)
         env._replay_target_pos, env._replay_target_quat = _interpolate_pose_xyzw(
@@ -1122,6 +1196,28 @@ def step_ppo_physics(
         if incoming_samples is not None:
             raw = incoming_wrench_all_bodies(env)[incoming_body_index]
             incoming_samples.append(raw)
+            robot_joint_pos = env._robot.data.joint_pos
+            robot_joint_vel = env._robot.data.joint_vel
+            robot_joint_pos = (
+                robot_joint_pos.torch if hasattr(robot_joint_pos, "torch") else robot_joint_pos
+            )
+            robot_joint_vel = (
+                robot_joint_vel.torch if hasattr(robot_joint_vel, "torch") else robot_joint_vel
+            )
+            incoming_joint_pos_samples.append(
+                torch.as_tensor(robot_joint_pos, device=env.device)[0, :7]
+                .detach()
+                .cpu()
+                .numpy()
+                .astype(np.float64, copy=True)
+            )
+            incoming_joint_vel_samples.append(
+                torch.as_tensor(robot_joint_vel, device=env.device)[0, :7]
+                .detach()
+                .cpu()
+                .numpy()
+                .astype(np.float64, copy=True)
+            )
             if incoming_base_at_k_samples is not None:
                 incoming_base_at_k_samples.append(
                     link7_incoming_wrench_base_at_k(
@@ -1136,7 +1232,11 @@ def step_ppo_physics(
     env._compute_intermediate_values(dt=env.physics_dt)
     if incoming_samples is None:
         return None
-    streams = {"native": np.asarray(incoming_samples, dtype=np.float64)}
+    streams = {
+        "native": np.asarray(incoming_samples, dtype=np.float64),
+        "joint_pos": np.asarray(incoming_joint_pos_samples, dtype=np.float64),
+        "joint_vel": np.asarray(incoming_joint_vel_samples, dtype=np.float64),
+    }
     if incoming_base_at_k_samples is not None:
         streams["base_at_K"] = np.asarray(incoming_base_at_k_samples, dtype=np.float64)
     return streams
@@ -1494,11 +1594,96 @@ def configure_ppo_scene(cfg) -> None:
             actuator.effort_limit_sim = 100.0
 
 
+def configure_force_fit_physics(cfg) -> dict[str, object]:
+    """Apply explicit, reproducible contact-fit overrides before scene creation."""
+
+    if args.contact_offset_m is not None:
+        offset = float(args.contact_offset_m)
+        cfg.task.held_asset.spawn.collision_props.contact_offset = offset
+        cfg.task.fixed_asset.spawn.collision_props.contact_offset = offset
+
+    def set_material(term_name: str, static: float | None, dynamic: float | None) -> None:
+        if static is None and dynamic is None:
+            return
+        term = getattr(cfg.events, term_name, None)
+        if term is None or not hasattr(term, "params"):
+            raise RuntimeError(f"force-fit material event is unavailable: {term_name}")
+        params = dict(term.params)
+        if static is not None:
+            params["static_friction_range"] = (float(static), float(static))
+        if dynamic is not None:
+            params["dynamic_friction_range"] = (float(dynamic), float(dynamic))
+        params["num_buckets"] = 1
+        term.params = params
+
+    set_material(
+        "held_physics_material",
+        args.held_static_friction,
+        args.held_dynamic_friction,
+    )
+    set_material(
+        "fixed_physics_material",
+        args.fixed_static_friction,
+        args.fixed_dynamic_friction,
+    )
+
+    cfg.ctrl.default_task_prop_gains = [
+        float(value) * float(args.task_kp_scale)
+        for value in cfg.ctrl.default_task_prop_gains
+    ]
+    if hasattr(cfg.ctrl, "default_task_deriv_gains"):
+        cfg.ctrl.default_task_deriv_gains = [
+            float(value) * float(args.task_kd_scale)
+            for value in cfg.ctrl.default_task_deriv_gains
+        ]
+    if args.solver_position_iterations is not None:
+        iterations = int(args.solver_position_iterations)
+        cfg.task.held_asset.spawn.rigid_props.solver_position_iteration_count = iterations
+        cfg.task.fixed_asset.spawn.rigid_props.solver_position_iteration_count = iterations
+        cfg.robot.spawn.rigid_props.solver_position_iteration_count = iterations
+        cfg.robot.spawn.articulation_props.solver_position_iteration_count = iterations
+    if args.solver_velocity_iterations is not None:
+        iterations = int(args.solver_velocity_iterations)
+        cfg.task.held_asset.spawn.rigid_props.solver_velocity_iteration_count = iterations
+        cfg.task.fixed_asset.spawn.rigid_props.solver_velocity_iteration_count = iterations
+        cfg.robot.spawn.rigid_props.solver_velocity_iteration_count = iterations
+        cfg.robot.spawn.articulation_props.solver_velocity_iteration_count = iterations
+
+    return {
+        "contact_offset_m": (
+            float(args.contact_offset_m) if args.contact_offset_m is not None else None
+        ),
+        "held_static_friction": args.held_static_friction,
+        "held_dynamic_friction": args.held_dynamic_friction,
+        "fixed_static_friction": args.fixed_static_friction,
+        "fixed_dynamic_friction": args.fixed_dynamic_friction,
+        "task_kp_scale": float(args.task_kp_scale),
+        "task_kd_scale": float(args.task_kd_scale),
+        "solver_position_iterations": args.solver_position_iterations,
+        "solver_velocity_iterations": args.solver_velocity_iterations,
+    }
+
+
 def main() -> None:
     q, ee_pose, gripper_width, timestamps = load_real_data(args.h5)
     link7_frame_calibration = load_link7_frame_calibration(
         args.link7_frame_calibration
     )
+    force_alignment_config = (
+        ForceAlignmentConfig.load(args.force_alignment_config)
+        if args.force_alignment_config is not None
+        else ForceAlignmentConfig(
+            cutoff_hz=float(args.link7_cutoff_hz),
+            output_hz=float(args.fps),
+        )
+    )
+    online_force_alignment_enabled = link7_frame_calibration is not None
+    if online_force_alignment_enabled and not np.isclose(args.link7_force_gain, 1.0):
+        raise ValueError(
+            "online base-frame force alignment requires --link7-force-gain 1.0"
+        )
+    if args.add_force_model_noise and not online_force_alignment_enabled:
+        raise ValueError("force_model noise requires --link7-frame-calibration")
     sim_pose, alignment = align_real_pose(
         ee_pose,
         args.h5,
@@ -1531,6 +1716,7 @@ def main() -> None:
     # Cartesian error, which makes the rendered arm follow the wrong motion.
     cfg.ctrl.reset_joints = q[0].tolist()
     configure_ppo_scene(cfg)
+    force_fit_physics = configure_force_fit_physics(cfg)
     configure_aligned_visual_scene(cfg)
     print("[ReplayStage] PPO physics and aligned visual scene configured", flush=True)
     # Use the task's original visible independent HeldAsset. It already has
@@ -1578,6 +1764,7 @@ def main() -> None:
     print("[ReplayStage] continuous PPO environment constructed", flush=True)
     try:
         env.prepare_replay_state()
+        env.task_deriv_gains *= float(args.task_kd_scale)
         topology_report = articulation_load_path_topology(env)
         (args.output_dir / "articulation_load_path_topology.json").write_text(
             json.dumps(topology_report, indent=2), encoding="utf-8"
@@ -1696,6 +1883,8 @@ def main() -> None:
         incoming_body_stream = []
         link7_highrate_raw = []
         link7_highrate_base_at_k = []
+        link7_highrate_joint_pos = []
+        link7_highrate_joint_vel = []
         link7_highrate_times = []
         link7_frame_slices = []
         print(f"[LoadPath] articulation bodies={incoming_body_names}", flush=True)
@@ -1723,6 +1912,32 @@ def main() -> None:
             if index == 0:
                 first_link7_raw = incoming_all_bodies[link7_body_index]
                 link7_highrate_raw.append(first_link7_raw)
+                robot_joint_pos = env._robot.data.joint_pos
+                robot_joint_vel = env._robot.data.joint_vel
+                robot_joint_pos = (
+                    robot_joint_pos.torch
+                    if hasattr(robot_joint_pos, "torch")
+                    else robot_joint_pos
+                )
+                robot_joint_vel = (
+                    robot_joint_vel.torch
+                    if hasattr(robot_joint_vel, "torch")
+                    else robot_joint_vel
+                )
+                link7_highrate_joint_pos.append(
+                    torch.as_tensor(robot_joint_pos, device=env.device)[0, :7]
+                    .detach()
+                    .cpu()
+                    .numpy()
+                    .astype(np.float64, copy=True)
+                )
+                link7_highrate_joint_vel.append(
+                    torch.as_tensor(robot_joint_vel, device=env.device)[0, :7]
+                    .detach()
+                    .cpu()
+                    .numpy()
+                    .astype(np.float64, copy=True)
+                )
                 if link7_frame_calibration is not None:
                     link7_highrate_base_at_k.append(
                         link7_incoming_wrench_base_at_k(
@@ -1737,6 +1952,8 @@ def main() -> None:
                 if interval_link7 is None or not len(interval_link7["native"]):
                     raise RuntimeError(f"no panda_link7 substep samples for frame {index}")
                 link7_highrate_raw.extend(interval_link7["native"])
+                link7_highrate_joint_pos.extend(interval_link7["joint_pos"])
+                link7_highrate_joint_vel.extend(interval_link7["joint_vel"])
                 if link7_frame_calibration is not None:
                     if "base_at_K" not in interval_link7:
                         raise RuntimeError("link7 base/K stream missing after frame calibration")
@@ -1812,42 +2029,98 @@ def main() -> None:
             if link7_frame_calibration is not None
             else None
         )
+        link7_highrate_joint_pos_array = np.asarray(
+            link7_highrate_joint_pos, dtype=np.float64
+        )
+        link7_highrate_joint_vel_array = np.asarray(
+            link7_highrate_joint_vel, dtype=np.float64
+        )
         link7_highrate_time_array = np.asarray(link7_highrate_times, dtype=np.float64)
         if (
             link7_highrate_base_at_k_array is not None
             and len(link7_highrate_base_at_k_array) != len(link7_highrate_raw_array)
         ):
             raise RuntimeError("native and base/K link7 high-rate streams are not aligned")
+        if (
+            link7_highrate_joint_pos_array.shape != (len(link7_highrate_raw_array), 7)
+            or link7_highrate_joint_vel_array.shape != (len(link7_highrate_raw_array), 7)
+        ):
+            raise RuntimeError("panda_link7 wrench and high-rate joint states are not aligned")
         baseline_mask = link7_highrate_time_array <= 3.0
         if not np.any(baseline_mask):
             raise RuntimeError("panda_link7 stream has no samples in the 3 second baseline window")
-        link7_baseline = np.median(link7_highrate_raw_array[baseline_mask], axis=0)
-        link7_highrate_corrected = link7_highrate_raw_array - link7_baseline
-        link7_highrate_despiked = causal_median_filter(
+        native_baseline = np.median(link7_highrate_raw_array[baseline_mask], axis=0)
+        link7_highrate_corrected = link7_highrate_raw_array - native_baseline
+        native_highrate_despiked = causal_median_filter(
             link7_highrate_corrected,
             window=3,
         )
-        link7_highrate_filtered, link7_filter_alpha = causal_lowpass(
-            link7_highrate_despiked,
+        native_highrate_filtered, _native_filter_alpha = causal_lowpass(
+            native_highrate_despiked,
             float(env.physics_dt),
             float(args.link7_cutoff_hz),
         )
-        link7_frame_filtered = np.asarray(
-            [
-                np.mean(link7_highrate_filtered[start:stop], axis=0)
-                for start, stop in link7_frame_slices
-            ],
-            dtype=np.float64,
-        )
+        frame_time_array = np.asarray(replay_timestamps, dtype=np.float64)
+        force_alignment_arrays = None
+        if online_force_alignment_enabled:
+            force_alignment_arrays = process_force_series(
+                link7_highrate_time_array,
+                link7_highrate_base_at_k_array[:, :3],
+                link7_highrate_joint_pos_array,
+                joint_vel=link7_highrate_joint_vel_array,
+                config=force_alignment_config,
+                domain="sim",
+                add_model_noise=bool(args.add_force_model_noise),
+                seed=int(args.force_noise_seed),
+            )
+            frame_force_clean = interval_mean_to_frames(
+                link7_highrate_time_array,
+                force_alignment_arrays["force_clean"],
+                frame_time_array,
+            )
+            frame_force_model = interval_mean_to_frames(
+                link7_highrate_time_array,
+                force_alignment_arrays["force_model"],
+                frame_time_array,
+            )
+            link7_frame_filtered = force_to_zero_torque_wrench(frame_force_clean)
+            link7_frame_calibrated = force_to_zero_torque_wrench(frame_force_model)
+            rms_source = force_alignment_arrays["baseline_corrected"]
+            final_tare = force_alignment_arrays["residual_tare"][-1]
+            link7_baseline = np.concatenate((final_tare, np.zeros(3, dtype=np.float64)))
+            link7_filter_alpha = float(
+                1.0
+                - np.exp(
+                    -2.0
+                    * np.pi
+                    * force_alignment_config.cutoff_hz
+                    * float(env.physics_dt)
+                )
+            )
+            primary_force_source = "panda_link7_force_model_base"
+            clean_force_source = "panda_link7_force_clean_base"
+        else:
+            link7_frame_filtered = np.asarray(
+                [
+                    np.mean(native_highrate_filtered[start:stop], axis=0)
+                    for start, stop in link7_frame_slices
+                ],
+                dtype=np.float64,
+            )
+            link7_frame_calibrated = link7_frame_filtered * float(args.link7_force_gain)
+            rms_source = link7_highrate_corrected[:, :3]
+            link7_baseline = native_baseline
+            link7_filter_alpha = _native_filter_alpha
+            primary_force_source = "panda_link7_wrench_calibrated_native_legacy"
+            clean_force_source = "panda_link7_wrench_filtered_native_legacy"
         link7_frame_rms = np.asarray(
             [
-                np.sqrt(np.mean(np.sum(link7_highrate_corrected[start:stop, :3] ** 2, axis=1)))
+                np.sqrt(np.mean(np.sum(rms_source[start:stop, :3] ** 2, axis=1)))
                 for start, stop in link7_frame_slices
             ],
             dtype=np.float64,
         )
         link7_force_gain = float(args.link7_force_gain)
-        link7_frame_calibrated = link7_frame_filtered * link7_force_gain
         link7_frame_rms_calibrated = link7_frame_rms * link7_force_gain
         link7_force_norm = np.linalg.norm(link7_frame_calibrated[:, :3], axis=1)
         jam_minimum_frames = max(1, int(np.ceil(float(args.jam_min_duration_s) * args.fps)))
@@ -1861,7 +2134,7 @@ def main() -> None:
                 link7_highrate_time_array,
                 link7_highrate_raw_array,
                 link7_highrate_corrected,
-                link7_highrate_filtered,
+                native_highrate_filtered,
             )
         )
         write_matrix_csv(
@@ -1872,6 +2145,21 @@ def main() -> None:
             + [f"filtered_{name}" for name in wrench_header],
             link7_highrate_table,
         )
+        write_matrix_csv(
+            args.output_dir / "panda_link7_joint_state_120hz.csv",
+            [
+                "timestamp",
+                *[f"q{index}" for index in range(7)],
+                *[f"qd{index}" for index in range(7)],
+            ],
+            np.column_stack(
+                (
+                    link7_highrate_time_array,
+                    link7_highrate_joint_pos_array,
+                    link7_highrate_joint_vel_array,
+                )
+            ),
+        )
         if link7_highrate_base_at_k_array is not None:
             write_matrix_csv(
                 args.output_dir / "panda_link7_wrench_base_at_K_120hz.csv",
@@ -1879,6 +2167,55 @@ def main() -> None:
                 np.column_stack(
                     (link7_highrate_time_array, link7_highrate_base_at_k_array)
                 ),
+            )
+        if force_alignment_arrays is not None:
+            force_alignment_table = np.column_stack(
+                (
+                    link7_highrate_time_array,
+                    force_alignment_arrays["raw_base"],
+                    force_alignment_arrays["predicted_baseline"],
+                    force_alignment_arrays["residual_tare"],
+                    force_alignment_arrays["baseline_corrected"],
+                    force_alignment_arrays["median_filtered"],
+                    force_alignment_arrays["force_clean"],
+                    force_alignment_arrays["force_model"],
+                    force_alignment_arrays["tare_ready"].astype(np.float64),
+                )
+            )
+            write_matrix_csv(
+                args.output_dir / "panda_link7_force_alignment_120hz.csv",
+                [
+                    "timestamp",
+                    *[
+                        f"{prefix}_{axis}"
+                        for prefix in (
+                            "raw_base",
+                            "predicted_baseline",
+                            "residual_tare",
+                            "baseline_corrected",
+                            "median_filtered",
+                            "force_clean",
+                            "force_model",
+                        )
+                        for axis in ("Fx", "Fy", "Fz")
+                    ],
+                    "tare_ready",
+                ],
+                force_alignment_table,
+            )
+            write_matrix_csv(
+                args.output_dir / "panda_link7_force_clean.csv",
+                wrench_header,
+                link7_frame_filtered,
+            )
+            write_matrix_csv(
+                args.output_dir / "panda_link7_force_model.csv",
+                wrench_header,
+                link7_frame_calibrated,
+            )
+            (args.output_dir / "force_alignment_config.json").write_text(
+                json.dumps(force_alignment_config.to_dict(), indent=2),
+                encoding="utf-8",
             )
         write_matrix_csv(
             args.output_dir / "panda_link7_wrench_filtered.csv",
@@ -1897,7 +2234,9 @@ def main() -> None:
         )
         print(
             "[Link7Force] "
-            f"samples_120hz={len(link7_highrate_raw_array)} cutoff_hz={args.link7_cutoff_hz:.3f} "
+            f"samples_120hz={len(link7_highrate_raw_array)} "
+            f"source={primary_force_source} "
+            f"cutoff_hz={force_alignment_config.cutoff_hz if online_force_alignment_enabled else args.link7_cutoff_hz:.3f} "
             f"alpha={link7_filter_alpha:.6f} gain={link7_force_gain:.3f} "
             f"p95={np.percentile(link7_force_norm, 95):.6f}N "
             f"jam_frames={int(np.count_nonzero(link7_jam))}",
@@ -1982,6 +2321,7 @@ def main() -> None:
                 "damping": 0.0,
                 "effort_limit_sim": 100.0,
             },
+            "force_fit_physics": force_fit_physics,
             "physical_pose_error_m": {
                 "first": float(physical_pose_errors[0]),
                 "median": float(np.median(physical_pose_errors)),
@@ -2062,7 +2402,11 @@ def main() -> None:
             "fps": float(args.fps),
             "panda_link7_force_feedback": {
                 "source": "PhysX get_link_incoming_joint_force at panda_link7",
-                "source_frame": "PhysX native incoming-joint frame",
+                "source_frame": (
+                    "robot_base_O"
+                    if online_force_alignment_enabled
+                    else "PhysX native incoming-joint frame"
+                ),
                 "base_at_K_file": (
                     "panda_link7_wrench_base_at_K_120hz.csv"
                     if link7_highrate_base_at_k_array is not None
@@ -2092,11 +2436,25 @@ def main() -> None:
                     else None
                 ),
                 "sample_rate_hz": float(1.0 / env.physics_dt),
-                "baseline_seconds": 3.0,
+                "baseline_seconds": float(force_alignment_config.tare_seconds),
                 "baseline": link7_baseline.tolist(),
-                "causal_lowpass_cutoff_hz": float(args.link7_cutoff_hz),
+                "motion_baseline_features": (
+                    force_alignment_config.sim_baseline.to_dict()["features"]
+                    if online_force_alignment_enabled
+                    else None
+                ),
+                "motion_baseline_weights": (
+                    force_alignment_config.sim_baseline.weights.tolist()
+                    if online_force_alignment_enabled
+                    else None
+                ),
+                "causal_lowpass_cutoff_hz": float(
+                    force_alignment_config.cutoff_hz
+                    if online_force_alignment_enabled
+                    else args.link7_cutoff_hz
+                ),
                 "causal_lowpass_alpha": link7_filter_alpha,
-                "causal_median_window": 3,
+                "causal_median_window": int(force_alignment_config.median_window),
                 "post_filter_force_gain": link7_force_gain,
                 "downsample": "mean of filtered 120 Hz samples in each output interval",
                 "jam_force_threshold_n": float(args.jam_force_threshold_n),
@@ -2107,20 +2465,65 @@ def main() -> None:
                 if args.record_contact_pair
                 else None,
             },
-            "force_collection": {
-                "primary_file": "panda_link7_wrench_calibrated.csv",
-                "primary_source": (
-                    "120 Hz filtered panda_link7 incoming joint wrench with fixed "
-                    f"post-filter gain {link7_force_gain:.6g}"
+            "force_alignment_contract": {
+                "version": FORCE_ALIGNMENT_VERSION if online_force_alignment_enabled else None,
+                "enabled": bool(online_force_alignment_enabled),
+                "config_file": (
+                    "force_alignment_config.json" if online_force_alignment_enabled else None
                 ),
-                "raw_filtered_file": "panda_link7_wrench_filtered.csv",
+                "input_file": (
+                    "panda_link7_wrench_base_at_K_120hz.csv"
+                    if online_force_alignment_enabled
+                    else "panda_link7_wrench_120hz.csv"
+                ),
+                "diagnostic_file": (
+                    "panda_link7_force_alignment_120hz.csv"
+                    if online_force_alignment_enabled
+                    else None
+                ),
+                "clean_file": (
+                    "panda_link7_force_clean.csv"
+                    if online_force_alignment_enabled
+                    else "panda_link7_wrench_filtered.csv"
+                ),
+                "model_file": (
+                    "panda_link7_force_model.csv"
+                    if online_force_alignment_enabled
+                    else "panda_link7_wrench_calibrated.csv"
+                ),
+                "force_frame": (
+                    "robot_base_O" if online_force_alignment_enabled else "PhysX_native"
+                ),
+                "torque_mode": "zero" if online_force_alignment_enabled else "legacy",
+                "fixed_delay_frames": 0,
+                "amplitude_mapping": "identity",
+                "model_noise_enabled": bool(
+                    online_force_alignment_enabled and args.add_force_model_noise
+                ),
+                "model_noise_seed": int(args.force_noise_seed),
+            },
+            "force_collection": {
+                "primary_file": (
+                    "panda_link7_force_model.csv"
+                    if online_force_alignment_enabled
+                    else "panda_link7_wrench_calibrated.csv"
+                ),
+                "primary_source": primary_force_source,
+                "clean_source": clean_force_source,
+                "raw_filtered_file": (
+                    "panda_link7_force_clean.csv"
+                    if online_force_alignment_enabled
+                    else "panda_link7_wrench_filtered.csv"
+                ),
                 "force_gain": link7_force_gain,
                 "force_sensor_exported": False,
                 "component_order": wrench_header,
                 "units": ["N", "N", "N", "N*m", "N*m", "N*m"],
                 "collection_note": (
-                    "panda_link7 is sampled at every PhysX substep; force_sensor streams "
-                    "are retained only for diagnosis and are not training inputs"
+                    "panda_link7 is sampled at every PhysX substep; the aligned model "
+                    "stream is causal and carries zero torque"
+                    if online_force_alignment_enabled
+                    else "legacy native-frame force stream"
                 ),
             },
             "contact_pair_collection": {
@@ -2156,7 +2559,15 @@ except SystemExit as exc:
         args.output_dir / "panda_link7_force_feedback.csv",
     ]
     if args.link7_frame_calibration is not None:
-        expected.append(args.output_dir / "panda_link7_wrench_base_at_K_120hz.csv")
+        expected.extend(
+            (
+                args.output_dir / "panda_link7_wrench_base_at_K_120hz.csv",
+                args.output_dir / "panda_link7_force_alignment_120hz.csv",
+                args.output_dir / "panda_link7_force_clean.csv",
+                args.output_dir / "panda_link7_force_model.csv",
+                args.output_dir / "force_alignment_config.json",
+            )
+        )
     if exc.code in (None, 0) and not all(path.is_file() for path in expected):
         print(
             "[ReplayFatal] premature SystemExit(0) before rollout outputs were saved",

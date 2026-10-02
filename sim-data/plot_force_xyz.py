@@ -23,7 +23,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-ROOT = Path("/home/sutai/workspace/gujiawei/isaac_env")
+ROOT = Path(__file__).resolve().parents[1]
 REAL_COLOR = "#d62728"   # red  = real robot
 SIM_COLOR = "#1f77b4"    # blue = simulation
 

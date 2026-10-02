@@ -8,6 +8,14 @@ outputs/
 scripts/benchmarking/
 scripts/demos/
 __pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.deps/
+.env
+.env.local
 
 # Local experiment artifacts and backup copies.
 backups/

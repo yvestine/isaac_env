@@ -1,0 +1,402 @@
+[
+  {
+    "trajectory": 0,
+    "frames": 267,
+    "force_source": "panda_link7_wrench_contact_isolated_base_at_K",
+    "force_norm_p95_n": 0.42268577218055725,
+    "force_norm_max_n": 0.9026851654052734,
+    "torque_norm_p95_nm": 0.09766680747270584,
+    "src_h5": "outputs/traj0_verified_visual_link7_force_smooth/traj_0/data.h5",
+    "video_dir": "outputs/traj0_verified_visual_link7_force_smooth/traj_0"
+  },
+  {
+    "trajectory": 1,
+    "frames": 188,
+    "force_source": "panda_link7_wrench_contact_isolated_base_at_K",
+    "force_norm_p95_n": 0.15300795435905457,
+    "force_norm_max_n": 0.25055938959121704,
+    "torque_norm_p95_nm": 0.047529444098472595,
+    "src_h5": "outputs/link7_success_force_pairs/traj_1/data.h5",
+    "video_dir": "outputs/sim_force/traj_1"
+  },
+  {
+    "trajectory": 2,
+    "frames": 186,
+    "force_source": "panda_link7_wrench_contact_isolated_base_at_K",
+    "force_norm_p95_n": 0.36784234642982483,
+    "force_norm_max_n": 0.488116592168808,
+    "torque_norm_p95_nm": 0.10553065687417984,
+    "src_h5": "outputs/link7_success_force_pairs/traj_2/data.h5",
+    "video_dir": "outputs/sim_force/traj_2"
+  },
+  {
+    "trajectory": 3,
+    "frames": 167,
+    "force_source": "panda_link7_wrench_contact_isolated_base_at_K",
+    "force_norm_p95_n": 0.5820881724357605,
+    "force_norm_max_n": 1.2925993204116821,
+    "torque_norm_p95_nm": 0.16340872645378113,
+    "src_h5": "outputs/link7_success_force_pairs/traj_3/data.h5",
+    "video_dir": "outputs/sim_force/traj_3"
+  },
+  {
+    "trajectory": 4,
+    "frames": 178,
+    "force_source": "panda_link7_wrench_contact_isolated_base_at_K",
+    "force_norm_p95_n": 0.39674443006515503,
+    "force_norm_max_n": 0.45862534642219543,
+    "torque_norm_p95_nm": 0.11600545048713684,
+    "src_h5": "outputs/link7_success_force_pairs/traj_4/data.h5",
+    "video_dir": "outputs/sim_force/traj_4"
+  },
+  {
+    "trajectory": 5,
+    "frames": 172,
+    "force_source": "panda_link7_wrench_contact_isolated_base_at_K",
+    "force_norm_p95_n": 0.5522525310516357,
+    "force_norm_max_n": 0.9063677191734314,
+    "torque_norm_p95_nm": 0.1578475832939148,
+    "src_h5": "outputs/link7_success_force_pairs/traj_5/data.h5",
+    "video_dir": "outputs/sim_force/traj_5"
+  },
+  {
+    "trajectory": 6,
+    "frames": 177,
+    "force_source": "panda_link7_wrench_contact_isolated_base_at_K",
+    "force_norm_p95_n": 0.294707328081131,
+    "force_norm_max_n": 0.4860212206840515,
+    "torque_norm_p95_nm": 0.055342886596918106,
+    "src_h5": "outputs/link7_success_force_pairs/traj_6/data.h5",
+    "video_dir": "outputs/sim_force/traj_6"
+  },
+  {
+    "trajectory": 7,
+    "frames": 253,
+    "force_source": "panda_link7_wrench_contact_isolated_base_at_K",
+    "force_norm_p95_n": 0.7300235629081726,
+    "force_norm_max_n": 1.293976068496704,
+    "torque_norm_p95_nm": 0.15659171342849731,
+    "src_h5": "outputs/link7_success_force_pairs/traj_7/data.h5",
+    "video_dir": "outputs/sim_force/traj_7"
+  },
+  {
+    "trajectory": 8,
+    "frames": 184,
+    "force_source": "panda_link7_wrench_contact_isolated_base_at_K",
+    "force_norm_p95_n": 0.8106482028961182,
+    "force_norm_max_n": 1.4402387142181396,
+    "torque_norm_p95_nm": 0.13207364082336426,
+    "src_h5": "outputs/link7_success_force_pairs/traj_8/data.h5",
+    "video_dir": "outputs/sim_force/traj_8"
+  },
+  {
+    "trajectory": 9,
+    "frames": 368,
+    "force_source": "panda_link7_wrench_contact_isolated_base_at_K",
+    "force_norm_p95_n": 0.9850145578384399,
+    "force_norm_max_n": 1.818213939666748,
+    "torque_norm_p95_nm": 0.10903014242649078,
+    "src_h5": "outputs/link7_success_force_pairs/traj_9/data.h5",
+    "video_dir": "outputs/sim_force/traj_9"
+  },
+  {
+    "trajectory": 10,
+    "frames": 320,
+    "force_source": "panda_link7_wrench_contact_isolated_base_at_K",
+    "force_norm_p95_n": 0.5564401149749756,
+    "force_norm_max_n": 1.1899173259735107,
+    "torque_norm_p95_nm": 0.11356216669082642,
+    "src_h5": "outputs/link7_success_force_pairs/traj_10/data.h5",
+    "video_dir": "outputs/sim_force/traj_10"
+  },
+  {
+    "trajectory": 11,
+    "frames": 185,
+    "force_source": "panda_link7_wrench_contact_isolated_base_at_K",
+    "force_norm_p95_n": 3.5858242511749268,
+    "force_norm_max_n": 4.371680736541748,
+    "torque_norm_p95_nm": 0.24850472807884216,
+    "src_h5": "outputs/link7_success_force_pairs/traj_11/data.h5",
+    "video_dir": "outputs/sim_force/traj_11"
+  },
+  {
+    "trajectory": 12,
+    "frames": 256,
+    "force_source": "panda_link7_wrench_contact_isolated_base_at_K",
+    "force_norm_p95_n": 16.636022567749023,
+    "force_norm_max_n": 17.567541122436523,
+    "torque_norm_p95_nm": 3.0706193447113037,
+    "src_h5": "outputs/link7_success_force_pairs/traj_12/data.h5",
+    "video_dir": "outputs/sim_force/traj_12"
+  },
+  {
+    "trajectory": 13,
+    "frames": 291,
+    "force_source": "panda_link7_wrench_contact_isolated_base_at_K",
+    "force_norm_p95_n": 1.4365229606628418,
+    "force_norm_max_n": 2.2596511840820312,
+    "torque_norm_p95_nm": 0.18895351886749268,
+    "src_h5": "outputs/link7_success_force_pairs/traj_13/data.h5",
+    "video_dir": "outputs/sim_force/traj_13"
+  },
+  {
+    "trajectory": 14,
+    "frames": 153,
+    "force_source": "panda_link7_wrench_contact_isolated_base_at_K",
+    "force_norm_p95_n": 2.5984182357788086,
+    "force_norm_max_n": 3.9680330753326416,
+    "torque_norm_p95_nm": 0.7419580221176147,
+    "src_h5": "outputs/link7_success_force_pairs/traj_14/data.h5",
+    "video_dir": "outputs/sim_force/traj_14"
+  },
+  {
+    "trajectory": 15,
+    "frames": 133,
+    "force_source": "panda_link7_wrench_contact_isolated_base_at_K",
+    "force_norm_p95_n": 1.8449561595916748,
+    "force_norm_max_n": 2.3954241275787354,
+    "torque_norm_p95_nm": 0.2551857531070709,
+    "src_h5": "outputs/link7_success_force_pairs/traj_15/data.h5",
+    "video_dir": "outputs/sim_force/traj_15"
+  },
+  {
+    "trajectory": 16,
+    "frames": 230,
+    "force_source": "panda_link7_wrench_contact_isolated_base_at_K",
+    "force_norm_p95_n": 1.3089343309402466,
+    "force_norm_max_n": 2.3154244422912598,
+    "torque_norm_p95_nm": 0.16801977157592773,
+    "src_h5": "outputs/link7_success_force_pairs/traj_16/data.h5",
+    "video_dir": "outputs/sim_force/traj_16"
+  },
+  {
+    "trajectory": 17,
+    "frames": 265,
+    "force_source": "panda_link7_wrench_contact_isolated_base_at_K",
+    "force_norm_p95_n": 2.143868923187256,
+    "force_norm_max_n": 4.495372772216797,
+    "torque_norm_p95_nm": 0.7375175356864929,
+    "src_h5": "outputs/link7_success_force_pairs/traj_17/data.h5",
+    "video_dir": "outputs/sim_force/traj_17"
+  },
+  {
+    "trajectory": 18,
+    "frames": 138,
+    "force_source": "panda_link7_wrench_contact_isolated_base_at_K",
+    "force_norm_p95_n": 2.1381208896636963,
+    "force_norm_max_n": 2.719491481781006,
+    "torque_norm_p95_nm": 0.20447732508182526,
+    "src_h5": "outputs/link7_success_force_pairs/traj_18/data.h5",
+    "video_dir": "outputs/sim_force/traj_18"
+  },
+  {
+    "trajectory": 19,
+    "frames": 148,
+    "force_source": "panda_link7_wrench_contact_isolated_base_at_K",
+    "force_norm_p95_n": 2.1096174716949463,
+    "force_norm_max_n": 2.5720720291137695,
+    "torque_norm_p95_nm": 0.2633964419364929,
+    "src_h5": "outputs/link7_success_force_pairs/traj_19/data.h5",
+    "video_dir": "outputs/sim_force/traj_19"
+  },
+  {
+    "trajectory": 20,
+    "frames": 237,
+    "force_source": "panda_link7_wrench_contact_isolated_base_at_K",
+    "force_norm_p95_n": 1.8492220640182495,
+    "force_norm_max_n": 2.8079631328582764,
+    "torque_norm_p95_nm": 0.24400340020656586,
+    "src_h5": "outputs/link7_success_force_pairs/traj_20/data.h5",
+    "video_dir": "outputs/sim_force/traj_20"
+  },
+  {
+    "trajectory": 21,
+    "frames": 197,
+    "force_source": "panda_link7_wrench_contact_isolated_base_at_K",
+    "force_norm_p95_n": 1.6370397806167603,
+    "force_norm_max_n": 2.212553024291992,
+    "torque_norm_p95_nm": 0.1822882443666458,
+    "src_h5": "outputs/link7_success_force_pairs/traj_21/data.h5",
+    "video_dir": "outputs/sim_force/traj_21"
+  },
+  {
+    "trajectory": 22,
+    "frames": 169,
+    "force_source": "panda_link7_wrench_contact_isolated_base_at_K",
+    "force_norm_p95_n": 1.7010668516159058,
+    "force_norm_max_n": 2.4796392917633057,
+    "torque_norm_p95_nm": 0.1724899262189865,
+    "src_h5": "outputs/link7_success_force_pairs/traj_22/data.h5",
+    "video_dir": "outputs/sim_force/traj_22"
+  },
+  {
+    "trajectory": 23,
+    "frames": 167,
+    "force_source": "panda_link7_wrench_contact_isolated_base_at_K",
+    "force_norm_p95_n": 1.8413984775543213,
+    "force_norm_max_n": 2.4837732315063477,
+    "torque_norm_p95_nm": 0.2989637553691864,
+    "src_h5": "outputs/link7_success_force_pairs/traj_23/data.h5",
+    "video_dir": "outputs/sim_force/traj_23"
+  },
+  {
+    "trajectory": 24,
+    "frames": 173,
+    "force_source": "panda_link7_wrench_contact_isolated_base_at_K",
+    "force_norm_p95_n": 1.5983750820159912,
+    "force_norm_max_n": 3.024322748184204,
+    "torque_norm_p95_nm": 0.1751910150051117,
+    "src_h5": "outputs/link7_success_force_pairs/traj_24/data.h5",
+    "video_dir": "outputs/sim_force/traj_24"
+  },
+  {
+    "trajectory": 25,
+    "frames": 193,
+    "force_source": "panda_link7_wrench_contact_isolated_base_at_K",
+    "force_norm_p95_n": 1.3544021844863892,
+    "force_norm_max_n": 3.001091480255127,
+    "torque_norm_p95_nm": 0.20612654089927673,
+    "src_h5": "outputs/link7_success_force_pairs/traj_25/data.h5",
+    "video_dir": "outputs/sim_force/traj_25"
+  },
+  {
+    "trajectory": 26,
+    "frames": 103,
+    "force_source": "panda_link7_wrench_contact_isolated_base_at_K",
+    "force_norm_p95_n": 3.0773606300354004,
+    "force_norm_max_n": 3.7314980030059814,
+    "torque_norm_p95_nm": 0.42439112067222595,
+    "src_h5": "outputs/link7_success_force_pairs/traj_26/data.h5",
+    "video_dir": "outputs/sim_force/traj_26"
+  },
+  {
+    "trajectory": 27,
+    "frames": 150,
+    "force_source": "panda_link7_wrench_contact_isolated_base_at_K",
+    "force_norm_p95_n": 1.530322551727295,
+    "force_norm_max_n": 3.2721009254455566,
+    "torque_norm_p95_nm": 0.1940564513206482,
+    "src_h5": "outputs/link7_success_force_pairs/traj_27/data.h5",
+    "video_dir": "outputs/sim_force/traj_27"
+  },
+  {
+    "trajectory": 28,
+    "frames": 164,
+    "force_source": "panda_link7_wrench_contact_isolated_base_at_K",
+    "force_norm_p95_n": 2.1115713119506836,
+    "force_norm_max_n": 3.6719954013824463,
+    "torque_norm_p95_nm": 0.21278071403503418,
+    "src_h5": "outputs/link7_success_force_pairs/traj_28/data.h5",
+    "video_dir": "outputs/sim_force/traj_28"
+  },
+  {
+    "trajectory": 29,
+    "frames": 168,
+    "force_source": "panda_link7_wrench_contact_isolated_base_at_K",
+    "force_norm_p95_n": 1.6738866567611694,
+    "force_norm_max_n": 3.8286471366882324,
+    "torque_norm_p95_nm": 0.2887827754020691,
+    "src_h5": "outputs/link7_success_force_pairs/traj_29/data.h5",
+    "video_dir": "outputs/sim_force/traj_29"
+  },
+  {
+    "trajectory": 30,
+    "frames": 105,
+    "force_source": "panda_link7_wrench_contact_isolated_base_at_K",
+    "force_norm_p95_n": 7.483161449432373,
+    "force_norm_max_n": 8.203568458557129,
+    "torque_norm_p95_nm": 0.3669808804988861,
+    "src_h5": "outputs/link7_success_force_pairs/traj_30/data.h5",
+    "video_dir": "outputs/sim_force/traj_30"
+  },
+  {
+    "trajectory": 31,
+    "frames": 102,
+    "force_source": "panda_link7_wrench_contact_isolated_base_at_K",
+    "force_norm_p95_n": 3.3064966201782227,
+    "force_norm_max_n": 3.970440149307251,
+    "torque_norm_p95_nm": 0.439898818731308,
+    "src_h5": "outputs/link7_success_force_pairs/traj_31/data.h5",
+    "video_dir": "outputs/sim_force/traj_31"
+  },
+  {
+    "trajectory": 32,
+    "frames": 153,
+    "force_source": "panda_link7_wrench_contact_isolated_base_at_K",
+    "force_norm_p95_n": 1.812674641609192,
+    "force_norm_max_n": 4.604743480682373,
+    "torque_norm_p95_nm": 0.30215543508529663,
+    "src_h5": "outputs/link7_success_force_pairs/traj_32/data.h5",
+    "video_dir": "outputs/sim_force/traj_32"
+  },
+  {
+    "trajectory": 33,
+    "frames": 128,
+    "force_source": "panda_link7_wrench_contact_isolated_base_at_K",
+    "force_norm_p95_n": 2.815222978591919,
+    "force_norm_max_n": 4.501640796661377,
+    "torque_norm_p95_nm": 0.24701261520385742,
+    "src_h5": "outputs/link7_success_force_pairs/traj_33/data.h5",
+    "video_dir": "outputs/sim_force/traj_33"
+  },
+  {
+    "trajectory": 34,
+    "frames": 214,
+    "force_source": "panda_link7_wrench_contact_isolated_base_at_K",
+    "force_norm_p95_n": 3.5764505863189697,
+    "force_norm_max_n": 5.8490424156188965,
+    "torque_norm_p95_nm": 0.6484989523887634,
+    "src_h5": "outputs/link7_success_force_pairs/traj_34/data.h5",
+    "video_dir": "outputs/sim_force/traj_34"
+  },
+  {
+    "trajectory": 35,
+    "frames": 117,
+    "force_source": "panda_link7_wrench_contact_isolated_base_at_K",
+    "force_norm_p95_n": 3.6451425552368164,
+    "force_norm_max_n": 4.48279333114624,
+    "torque_norm_p95_nm": 0.41469064354896545,
+    "src_h5": "outputs/link7_success_force_pairs/traj_35/data.h5",
+    "video_dir": "outputs/sim_force/traj_35"
+  },
+  {
+    "trajectory": 36,
+    "frames": 100,
+    "force_source": "panda_link7_wrench_contact_isolated_base_at_K",
+    "force_norm_p95_n": 4.029312610626221,
+    "force_norm_max_n": 4.67921257019043,
+    "torque_norm_p95_nm": 0.4467678666114807,
+    "src_h5": "outputs/link7_success_force_pairs/traj_36/data.h5",
+    "video_dir": "outputs/sim_force/traj_36"
+  },
+  {
+    "trajectory": 37,
+    "frames": 99,
+    "force_source": "panda_link7_wrench_contact_isolated_base_at_K",
+    "force_norm_p95_n": 5.666743755340576,
+    "force_norm_max_n": 6.9852294921875,
+    "torque_norm_p95_nm": 0.7596011757850647,
+    "src_h5": "outputs/link7_success_force_pairs/traj_37/data.h5",
+    "video_dir": "outputs/sim_force/traj_37"
+  },
+  {
+    "trajectory": 38,
+    "frames": 115,
+    "force_source": "panda_link7_wrench_contact_isolated_base_at_K",
+    "force_norm_p95_n": 2.154405117034912,
+    "force_norm_max_n": 4.292362689971924,
+    "torque_norm_p95_nm": 0.2150617390871048,
+    "src_h5": "outputs/link7_success_force_pairs/traj_38/data.h5",
+    "video_dir": "outputs/sim_force/traj_38"
+  },
+  {
+    "trajectory": 39,
+    "frames": 75,
+    "force_source": "panda_link7_wrench_contact_isolated_base_at_K",
+    "force_norm_p95_n": 3.837614059448242,
+    "force_norm_max_n": 4.555718421936035,
+    "torque_norm_p95_nm": 0.44259679317474365,
+    "src_h5": "outputs/link7_success_force_pairs/traj_39/data.h5",
+    "video_dir": "outputs/sim_force/traj_39"
+  }
+]

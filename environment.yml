@@ -1,0 +1,9 @@
+name: env_isaaclab
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pip>=25
+  - cmake
+  - ninja
+  - git

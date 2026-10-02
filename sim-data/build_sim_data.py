@@ -22,7 +22,7 @@ from pathlib import Path
 import h5py
 import numpy as np
 
-ROOT = Path("/home/sutai/workspace/gujiawei/isaac_env")
+ROOT = Path(__file__).resolve().parents[1]
 PAIR_ROOT = ROOT / "outputs/link7_success_force_pairs"
 VIDEO_ROOT = ROOT / "outputs/sim_force"
 TRAJ0_DIR = ROOT / "outputs/traj0_verified_visual_link7_force_smooth/traj_0"

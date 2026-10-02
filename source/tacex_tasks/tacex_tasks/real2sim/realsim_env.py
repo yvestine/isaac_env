@@ -2781,7 +2781,7 @@ class RealSimEnv(ForgeEnv):
                 writer.writerow([step, *[row.get(name) for name in names]])
 
     def _get_curr_successes(self, success_threshold, check_rot=False):
-        if self.cfg_task.name != "peg_insert" or not bool(getattr(self.cfg_task, "align_only", False)):
+        if self.cfg_task.name != "peg_insert":
             return super()._get_curr_successes(success_threshold=success_threshold, check_rot=check_rot)
 
         held_base_pos, _ = factory_utils.get_held_base_pose(
@@ -2800,11 +2800,20 @@ class RealSimEnv(ForgeEnv):
         z_disp = held_base_pos[:, 2] - target_held_base_pos[:, 2]
 
         success_xy_threshold = float(getattr(self.cfg_task, "success_xy_threshold", 0.006))
-        min_height = float(getattr(self.cfg_task, "align_success_min_height", 0.03))
-        max_height = float(getattr(self.cfg_task, "align_success_max_height", 0.08))
         is_centered = xy_dist < success_xy_threshold
-        is_above_hole = torch.logical_and(z_disp > min_height, z_disp < max_height)
-        return torch.logical_and(is_centered, is_above_hole)
+        if bool(getattr(self.cfg_task, "align_only", False)):
+            min_height = float(getattr(self.cfg_task, "align_success_min_height", 0.03))
+            max_height = float(getattr(self.cfg_task, "align_success_max_height", 0.08))
+            is_above_hole = torch.logical_and(z_disp > min_height, z_disp < max_height)
+            return torch.logical_and(is_centered, is_above_hole)
+
+        # One explicit geometric insertion contract is shared by replay,
+        # force fitting and online evaluation.  The legacy Factory threshold
+        # converted success_threshold through the hole height and yielded a
+        # stricter 1 mm depth for this task.
+        success_z_threshold = float(getattr(self.cfg_task, "success_z_threshold", 0.003))
+        is_inserted = z_disp < success_z_threshold
+        return torch.logical_and(is_centered, is_inserted)
 
     def _get_factory_rew_dict(self, curr_successes):
         rew_dict, rew_scales = super()._get_factory_rew_dict(curr_successes)
@@ -3064,6 +3073,10 @@ class RealSimEnv(ForgeEnv):
         is_rendering = _sim_flag(self.sim, "has_gui") or _sim_flag(self.sim, "has_rtx_sensors")
 
         start = time.time()
+        if getattr(self, "_sim_data_force_zero_gravity", False):
+            sim_utils.SimulationContext.instance().physics_sim_view.set_gravity(
+                carb.Float3(0.0, 0.0, 0.0)
+            )
         # perform physics stepping
         for _ in range(self.cfg.decimation):
             self._sim_step_counter += 1
@@ -3080,6 +3093,30 @@ class RealSimEnv(ForgeEnv):
                 self.sim.render()
             # update buffers at sim dt
             self.scene.update(dt=self.physics_dt)
+            if getattr(self, "_sim_data_trace_physics", False):
+                trace_step = int(getattr(self, "_sim_data_trace_step", 0))
+                if trace_step < 12:
+                    q_trace = self.joint_pos[0, :7].detach().cpu().numpy()
+                    v_trace = self.joint_vel[0, :7].detach().cpu().numpy()
+                    q_target_trace = self._robot.data.joint_pos_target[0, :7].detach().cpu().numpy()
+                    v_target_trace = self._robot.data.joint_vel_target[0, :7].detach().cpu().numpy()
+                    applied_trace = self._robot.data.applied_torque[0, :7].detach().cpu().numpy()
+                    computed_trace = self._robot.data.computed_torque[0, :7].detach().cpu().numpy()
+                    stiffness_trace = self._robot.data.joint_stiffness[0, :7].detach().cpu().numpy()
+                    damping_trace = self._robot.data.joint_damping[0, :7].detach().cpu().numpy()
+                    print(
+                        f"[SimDataPhysicsTrace] substep={trace_step} "
+                        f"q={np.array2string(q_trace, precision=6)} "
+                        f"vel={np.array2string(v_trace, precision=6)} "
+                        f"q_target={np.array2string(q_target_trace, precision=6)} "
+                        f"vel_target={np.array2string(v_target_trace, precision=6)} "
+                        f"applied={np.array2string(applied_trace, precision=6)} "
+                        f"computed={np.array2string(computed_trace, precision=6)} "
+                        f"stiffness={np.array2string(stiffness_trace, precision=3)} "
+                        f"damping={np.array2string(damping_trace, precision=3)}",
+                        flush=True,
+                    )
+                self._sim_data_trace_step = trace_step + 1
 
         end = time.time()
         # print(f"Cost time:{end-start}")
@@ -3388,13 +3425,9 @@ class RealSimEnv(ForgeEnv):
                 stage.RemovePrim(joint_path)
 
     def _attach_held_asset(self, env_ids):
-        """Leave peg as an independent dynamic body held by finger contacts.
+        """Leave peg as an independent dynamic body held by finger contacts."""
 
-        The peg is initialized in the gripper by ``randomize_initial_state``.
-        After reset, PhysX alone advances it; no runtime joint, kinematic flag,
-        or per-step pose write is applied.  This preserves the contact impulse
-        when the peg hits the hole instead of teleporting it through the hole.
-        """
+        del env_ids
         return
 
     def _reset_idx(self, env_ids):

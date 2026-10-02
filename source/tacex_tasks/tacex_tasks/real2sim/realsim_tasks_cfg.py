@@ -38,6 +38,7 @@ class RealSimTask(FactoryTask):
     delay_until_ratio: float = 0.25
     contact_penalty_threshold_range = [5.0, 10.0]
     success_xy_threshold: float = 0.006
+    success_z_threshold: float = 0.003
     # Keep the newer reward terms available for later experiments, but disable
     # them for the baseline RL training configuration.
     alignment_reward_scale: float = 0.0
@@ -69,6 +70,7 @@ class RealSimPegInsert(PegInsert, RealSimTask):
     alignment_reward_tolerance: float = 0.004
     insertion_gate_tolerance: float = 0.006
     success_xy_threshold: float = 0.003
+    success_z_threshold: float = 0.003
 
     name = "peg_insert"
     fixed_asset_cfg = Hole8mm()
